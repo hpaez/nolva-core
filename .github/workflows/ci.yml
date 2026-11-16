@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 20
     # macOS minutes are expensive on private repos; iOS is built on release only.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
