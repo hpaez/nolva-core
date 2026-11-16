@@ -11,8 +11,8 @@
 import Foundation
 import PackageDescription
 
-let releaseURL = "" // nolva:url
-let releaseChecksum = "" // nolva:checksum
+let releaseURL = "https://api.github.com/repos/hpaez/nolva-core/releases/assets/753573065.zip" // nolva:url
+let releaseChecksum = "8418a04b6794dfaa2f2c37ce6d5ae45cefd5db038bfafde06df240ea81223777" // nolva:checksum
 
 let useLocalBinary = ProcessInfo.processInfo.environment["NOLVA_CORE_LOCAL"] == "1"
     || releaseURL.isEmpty
