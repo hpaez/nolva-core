@@ -922,21 +922,22 @@ public func FfiConverterTypePageInfo_lower(_ value: PageInfo) -> RustBuffer {
 /**
  * Errors surfaced to Swift (`throws`) and Kotlin (exceptions).
  *
- * Messages are for logs and diagnostics, not for end users: map the variant
- * to localized UI text on each platform.
+ * `reason` is for logs and diagnostics, not for end users: map the variant
+ * to localized UI text on each platform. (The field must not be called
+ * `message`: it would clash with `Throwable.message` in the Kotlin bindings.)
  */
 public 
 enum NolvaError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
-    case InvalidArgument(message: String
+    case InvalidArgument(reason: String
     )
-    case NotFound(message: String
+    case NotFound(reason: String
     )
-    case Unsupported(message: String
+    case Unsupported(reason: String
     )
-    case Storage(message: String
+    case Storage(reason: String
     )
 
     
@@ -968,16 +969,16 @@ public struct FfiConverterTypeNolvaError: FfiConverterRustBuffer {
 
         
         case 1: return .InvalidArgument(
-            message: try FfiConverterString.read(from: &buf)
+            reason: try FfiConverterString.read(from: &buf)
             )
         case 2: return .NotFound(
-            message: try FfiConverterString.read(from: &buf)
+            reason: try FfiConverterString.read(from: &buf)
             )
         case 3: return .Unsupported(
-            message: try FfiConverterString.read(from: &buf)
+            reason: try FfiConverterString.read(from: &buf)
             )
         case 4: return .Storage(
-            message: try FfiConverterString.read(from: &buf)
+            reason: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -991,24 +992,24 @@ public struct FfiConverterTypeNolvaError: FfiConverterRustBuffer {
 
         
         
-        case let .InvalidArgument(message):
+        case let .InvalidArgument(reason):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         
-        case let .NotFound(message):
+        case let .NotFound(reason):
             writeInt(&buf, Int32(2))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         
-        case let .Unsupported(message):
+        case let .Unsupported(reason):
             writeInt(&buf, Int32(3))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         
-        case let .Storage(message):
+        case let .Storage(reason):
             writeInt(&buf, Int32(4))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         }
     }
