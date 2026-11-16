@@ -1,0 +1,19 @@
+[package]
+name = "storage-engine"
+description = "Local persistence for Nolva: SQLite metadata and managed page files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+document-engine.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
