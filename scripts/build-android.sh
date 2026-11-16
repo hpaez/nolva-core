@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Builds the Android native libraries and Kotlin bindings into the Gradle
-# library module at android/nolva-core. Requires the Android NDK
-# (ANDROID_NDK_HOME) and cargo-ndk.
+# library module at android/nolva-core. Requires the Android NDK and cargo-ndk.
+#
+# Environment:
+#   ANDROID_NDK_HOME  NDK r28+ (falls back to ANDROID_NDK_LATEST_HOME on CI)
+#   ANDROID_ABIS      space-separated ABIs (default: "arm64-v8a armeabi-v7a x86_64")
+#   CARGO_PROFILE     cargo profile (default: release; CI uses "ci")
+#   ANDROID_MIN_SDK   default 26
 #
 # Outputs (both git-ignored, regenerated on every build):
 #   android/nolva-core/src/main/jniLibs/<abi>/libnolva_core.so
@@ -19,10 +24,20 @@ if [[ -z "$ANDROID_NDK_HOME" || ! -d "$ANDROID_NDK_HOME" ]]; then
   exit 1
 fi
 echo "Using NDK at $ANDROID_NDK_HOME"
-ANDROID_MIN_SDK="${ANDROID_MIN_SDK:-26}"
 
-ABIS=("arm64-v8a" "armeabi-v7a" "x86_64")
-RUST_TARGETS=("aarch64-linux-android" "armv7-linux-androideabi" "x86_64-linux-android")
+ANDROID_MIN_SDK="${ANDROID_MIN_SDK:-26}"
+CARGO_PROFILE="${CARGO_PROFILE:-release}"
+read -r -a ABIS <<< "${ANDROID_ABIS:-arm64-v8a armeabi-v7a x86_64}"
+
+rust_target() {
+  case "$1" in
+    arm64-v8a) echo "aarch64-linux-android" ;;
+    armeabi-v7a) echo "armv7-linux-androideabi" ;;
+    x86_64) echo "x86_64-linux-android" ;;
+    x86) echo "i686-linux-android" ;;
+    *) echo "error: unknown ABI '$1'" >&2; return 1 ;;
+  esac
+}
 
 MODULE="android/nolva-core/src/main"
 JNI_LIBS="$MODULE/jniLibs"
@@ -33,16 +48,24 @@ command -v cargo-ndk >/dev/null || {
   exit 1
 }
 
-rustup target add "${RUST_TARGETS[@]}"
+targets=()
+ndk_args=()
+for abi in "${ABIS[@]}"; do
+  targets+=("$(rust_target "$abi")")
+  ndk_args+=(-t "$abi")
+done
+
+rustup target add "${targets[@]}"
 rm -rf "$JNI_LIBS" "$KOTLIN_OUT/app/nolva/core"
 
-ndk_args=()
-for abi in "${ABIS[@]}"; do ndk_args+=(-t "$abi"); done
-
 cargo ndk "${ndk_args[@]}" --platform "$ANDROID_MIN_SDK" -o "$JNI_LIBS" \
-  build --release -p core-ffi
+  build --profile "$CARGO_PROFILE" -p core-ffi
+
+# cargo puts the "dev" profile under target/<triple>/debug.
+profile_dir="$CARGO_PROFILE"
+[[ "$profile_dir" == "dev" ]] && profile_dir="debug"
 
 bash scripts/generate-bindings.sh kotlin \
-  "target/aarch64-linux-android/release/libnolva_core.so" "$KOTLIN_OUT"
+  "target/${targets[0]}/$profile_dir/libnolva_core.so" "$KOTLIN_OUT"
 
-echo "Android libraries in $JNI_LIBS, Kotlin bindings in $KOTLIN_OUT"
+echo "Android libraries (${ABIS[*]}) in $JNI_LIBS, Kotlin bindings in $KOTLIN_OUT"

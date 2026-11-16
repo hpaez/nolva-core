@@ -2,6 +2,10 @@
 # Builds NolvaCoreFFI.xcframework (+ zip and SwiftPM checksum) and the Swift
 # bindings. Requires macOS with Xcode.
 #
+# Environment:
+#   IOS_INCLUDE_X86_64_SIM=1  also build the x86_64 simulator slice (only
+#                             needed to run the simulator on Intel Macs)
+#
 # Outputs:
 #   build/apple/NolvaCoreFFI.xcframework
 #   build/apple/NolvaCoreFFI.xcframework.zip
@@ -21,7 +25,10 @@ export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
 
 LIB_NAME="libnolva_core.a"
 DEVICE_TARGET="aarch64-apple-ios"
-SIM_TARGETS=("aarch64-apple-ios-sim" "x86_64-apple-ios")
+SIM_TARGETS=("aarch64-apple-ios-sim")
+if [[ "${IOS_INCLUDE_X86_64_SIM:-0}" == "1" ]]; then
+  SIM_TARGETS+=("x86_64-apple-ios")
+fi
 
 OUT="build/apple"
 GEN="$OUT/generated"
@@ -37,11 +44,12 @@ for target in "$DEVICE_TARGET" "${SIM_TARGETS[@]}"; do
   cargo build --release -p core-ffi --target "$target"
 done
 
-# Simulator slices must be a single fat library per platform.
-lipo -create \
-  "target/aarch64-apple-ios-sim/release/$LIB_NAME" \
-  "target/x86_64-apple-ios/release/$LIB_NAME" \
-  -output "$OUT/sim/$LIB_NAME"
+# The xcframework needs a single (possibly fat) library per platform.
+sim_libs=()
+for target in "${SIM_TARGETS[@]}"; do
+  sim_libs+=("target/$target/release/$LIB_NAME")
+done
+lipo -create "${sim_libs[@]}" -output "$OUT/sim/$LIB_NAME"
 
 bash scripts/generate-bindings.sh swift "target/$DEVICE_TARGET/release/$LIB_NAME" "$GEN"
 
@@ -60,5 +68,5 @@ swift package compute-checksum "$OUT/NolvaCoreFFI.xcframework.zip" > "$OUT/Nolva
 mkdir -p apple/Sources/NolvaCore
 cp "$GEN/NolvaCore.swift" apple/Sources/NolvaCore/NolvaCore.swift
 
-echo "XCFramework: $XCFRAMEWORK"
+echo "XCFramework: $XCFRAMEWORK (simulator: ${SIM_TARGETS[*]})"
 echo "Checksum:    $(cat "$OUT/NolvaCoreFFI.xcframework.zip.checksum")"
