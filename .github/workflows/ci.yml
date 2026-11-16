@@ -51,6 +51,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-ndk --locked --version 4.1.2
       - name: Build native libraries + Kotlin bindings
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: bash scripts/build-android.sh
