@@ -11,7 +11,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-: "${ANDROID_NDK_HOME:?ANDROID_NDK_HOME must point to an Android NDK (r28+)}"
+# GitHub's Ubuntu runners expose the newest preinstalled NDK as
+# ANDROID_NDK_LATEST_HOME; use it when ANDROID_NDK_HOME isn't set.
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+if [[ -z "$ANDROID_NDK_HOME" || ! -d "$ANDROID_NDK_HOME" ]]; then
+  echo "error: set ANDROID_NDK_HOME to an Android NDK (r28+) directory" >&2
+  exit 1
+fi
+echo "Using NDK at $ANDROID_NDK_HOME"
 ANDROID_MIN_SDK="${ANDROID_MIN_SDK:-26}"
 
 ABIS=("arm64-v8a" "armeabi-v7a" "x86_64")
