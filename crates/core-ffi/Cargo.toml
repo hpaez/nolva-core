@@ -1,0 +1,34 @@
+[package]
+name = "core-ffi"
+description = "Public UniFFI surface of the Nolva core, consumed by the iOS and Android apps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# Stable library name: it determines the generated module names and the
+# native library the bindings load (libnolva_core.so / libnolva_core.a).
+name = "nolva_core"
+# cdylib: Android (.so) · staticlib: iOS (.a) · lib: Rust tests.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+document-engine.workspace = true
+storage-engine.workspace = true
+thiserror.workspace = true
+uniffi.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# UniFFI scaffolding necessarily contains `unsafe` FFI glue, so this crate
+# can't inherit the workspace-wide `unsafe_code = "forbid"`.
+[lints.rust]
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
