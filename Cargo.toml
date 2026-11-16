@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/document-engine",
+    "crates/storage-engine",
+    "crates/core-ffi",
+    "tools/uniffi-bindgen",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+repository = "https://github.com/hpaez/nolva-core"
+publish = false
+
+[workspace.dependencies]
+document-engine = { path = "crates/document-engine" }
+storage-engine = { path = "crates/storage-engine" }
+
+rusqlite = { version = "0.43", features = ["bundled"] }
+thiserror = "2"
+uniffi = "0.32"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = "debuginfo"
+panic = "unwind"
