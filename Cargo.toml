@@ -40,3 +40,10 @@ codegen-units = 1
 opt-level = "s"
 strip = "debuginfo"
 panic = "unwind"
+
+# Fast optimized build for CI checks: same as release minus the expensive
+# whole-program optimizations. Never used for published artifacts.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16

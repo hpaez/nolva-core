@@ -2,8 +2,10 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore: ["**.md", "docs/**"]
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,38 +19,44 @@ env:
 
 jobs:
   rust:
-    name: fmt · clippy · test
+    name: fmt · clippy · test · bindings
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host
+          # PRs read main's cache but don't write their own, keeping the
+          # repo under the 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-
-  bindings:
-    name: generate bindings
-    runs-on: ubuntu-latest
-    needs: rust
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p core-ffi --locked
-      - run: bash scripts/generate-bindings.sh kotlin target/release/libnolva_core.so build/bindings/kotlin
-      - run: bash scripts/generate-bindings.sh swift target/release/libnolva_core.so build/bindings/swift
+      # Reuses the debug artifacts from the steps above.
+      - run: cargo build -p core-ffi --locked
+      - run: bash scripts/generate-bindings.sh kotlin target/debug/libnolva_core.so build/bindings/kotlin
+      - run: bash scripts/generate-bindings.sh swift target/debug/libnolva_core.so build/bindings/swift
 
   android:
     name: android native build
     runs-on: ubuntu-latest
-    needs: rust
+    timeout-minutes: 20
     # macOS minutes are expensive on private repos; iOS is built on release only.
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-ndk --locked --version 4.1.2
-      - name: Build native libraries + Kotlin bindings
+        with:
+          shared-key: android-ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
+      - name: Build native library (arm64-v8a, ci profile) + Kotlin bindings
+        env:
+          ANDROID_ABIS: arm64-v8a
+          CARGO_PROFILE: ci
         run: bash scripts/build-android.sh

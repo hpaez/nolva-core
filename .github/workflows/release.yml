@@ -30,6 +30,7 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Check version and tag
@@ -44,17 +45,22 @@ jobs:
           fi
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host
       - run: cargo test --workspace --locked
 
   apple:
     needs: verify
     runs-on: macos-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple
       - name: Build XCFramework
         run: bash scripts/build-ios.sh
 
@@ -91,6 +97,7 @@ jobs:
   android:
     needs: apple
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
@@ -100,7 +107,11 @@ jobs:
           ref: ${{ env.TAG }}
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-ndk --locked --version 4.1.2
+        with:
+          shared-key: android-release
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
       - name: Build native libraries + Kotlin bindings
         run: bash scripts/build-android.sh
       - uses: actions/setup-java@v5
