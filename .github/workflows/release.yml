@@ -1,0 +1,118 @@
+# Publishes a versioned release of the core:
+#   - iOS:     NolvaCoreFFI.xcframework.zip as a GitHub Release asset, with
+#              Package.swift + Swift bindings committed and tagged vX.Y.Z.
+#   - Android: app.nolva:nolva-core:X.Y.Z (.aar) to GitHub Packages.
+#
+# Run it manually from the Actions tab after bumping the version in the root
+# Cargo.toml ([workspace.package] version) on main.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (must match Cargo.toml, e.g. 0.1.0)"
+        required: true
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VERSION: ${{ inputs.version }}
+  TAG: v${{ inputs.version }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check version and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z"; exit 1; }
+          cargo_version=$(grep -m1 -E '^version = ' Cargo.toml | cut -d'"' -f2)
+          [[ "$cargo_version" == "$VERSION" ]] || { echo "::error::Cargo.toml has $cargo_version"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG already exists"; exit 1
+          fi
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  apple:
+    needs: verify
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build XCFramework
+        run: bash scripts/build-ios.sh
+
+      - name: Upload artifact to a draft release
+        id: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" --draft --title "$TAG" --notes "Nolva core $VERSION" \
+            build/apple/NolvaCoreFFI.xcframework.zip
+          asset_id=$(gh api "repos/${{ github.repository }}/releases" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .assets[] | select(.name == \"NolvaCoreFFI.xcframework.zip\") | .id")
+          [[ -n "$asset_id" ]] || { echo "::error::asset id not found"; exit 1; }
+          # API asset URL (+ .zip so SwiftPM accepts it): works for private
+          # repos with a ~/.netrc entry for api.github.com.
+          echo "url=https://api.github.com/repos/${{ github.repository }}/releases/assets/${asset_id}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Commit Package.swift + Swift bindings and tag
+        run: |
+          bash scripts/update-package-swift.sh "${{ steps.upload.outputs.url }}" \
+            "$(cat build/apple/NolvaCoreFFI.xcframework.zip.checksum)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift apple/Sources/NolvaCore/NolvaCore.swift
+          git commit -m "release: $TAG"
+          git tag -a "$TAG" -m "Nolva core $VERSION"
+          git push origin HEAD:main "$TAG"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false --verify-tag
+
+  android:
+    needs: apple
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-ndk --locked --version 4.1.2
+      - name: Build native libraries + Kotlin bindings
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: bash scripts/build-android.sh
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: "9.5.0"
+      - name: Publish .aar to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: gradle -p android :nolva-core:publish -PcoreVersion="$VERSION"
