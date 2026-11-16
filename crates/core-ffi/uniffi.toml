@@ -1,0 +1,9 @@
+[bindings.kotlin]
+package_name = "app.nolva.core"
+cdylib_name = "nolva_core"
+
+[bindings.swift]
+module_name = "NolvaCore"
+ffi_module_name = "NolvaCoreFFI"
+ffi_module_filename = "NolvaCoreFFI"
+generate_module_map = true
