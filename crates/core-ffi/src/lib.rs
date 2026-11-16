@@ -54,32 +54,33 @@ pub struct PageInfo {
 
 /// Errors surfaced to Swift (`throws`) and Kotlin (exceptions).
 ///
-/// Messages are for logs and diagnostics, not for end users: map the variant
-/// to localized UI text on each platform.
+/// `reason` is for logs and diagnostics, not for end users: map the variant
+/// to localized UI text on each platform. (The field must not be called
+/// `message`: it would clash with `Throwable.message` in the Kotlin bindings.)
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum NolvaError {
-    #[error("invalid argument: {message}")]
-    InvalidArgument { message: String },
-    #[error("not found: {message}")]
-    NotFound { message: String },
-    #[error("unsupported: {message}")]
-    Unsupported { message: String },
-    #[error("storage error: {message}")]
-    Storage { message: String },
+    #[error("invalid argument: {reason}")]
+    InvalidArgument { reason: String },
+    #[error("not found: {reason}")]
+    NotFound { reason: String },
+    #[error("unsupported: {reason}")]
+    Unsupported { reason: String },
+    #[error("storage error: {reason}")]
+    Storage { reason: String },
 }
 
 impl From<DocumentError> for NolvaError {
     fn from(err: DocumentError) -> Self {
-        let message = err.to_string();
+        let reason = err.to_string();
         match err {
             DocumentError::InvalidTitle { .. } | DocumentError::InvalidId { .. } => {
-                Self::InvalidArgument { message }
+                Self::InvalidArgument { reason }
             }
             DocumentError::DocumentNotFound(_) | DocumentError::SourceImageNotFound(_) => {
-                Self::NotFound { message }
+                Self::NotFound { reason }
             }
-            DocumentError::UnsupportedImageFormat { .. } => Self::Unsupported { message },
-            DocumentError::Storage(_) => Self::Storage { message },
+            DocumentError::UnsupportedImageFormat { .. } => Self::Unsupported { reason },
+            DocumentError::Storage(_) => Self::Storage { reason },
         }
     }
 }
@@ -99,7 +100,7 @@ impl NolvaCore {
         let data_dir = PathBuf::from(&config.data_dir);
         if !data_dir.is_absolute() {
             return Err(NolvaError::InvalidArgument {
-                message: "data_dir must be an absolute path".into(),
+                reason: "data_dir must be an absolute path".into(),
             });
         }
         let files = LocalPageFileStore::new(&data_dir).map_err(storage_error)?;
@@ -173,7 +174,7 @@ impl From<Document> for DocumentInfo {
 
 fn storage_error(err: document_engine::PortError) -> NolvaError {
     NolvaError::Storage {
-        message: err.to_string(),
+        reason: err.to_string(),
     }
 }
 
