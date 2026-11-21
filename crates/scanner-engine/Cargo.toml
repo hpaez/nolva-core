@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 image.workspace = true
 imageproc.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

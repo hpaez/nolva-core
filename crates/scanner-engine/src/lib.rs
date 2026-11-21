@@ -9,9 +9,11 @@
 //! of any size and the result is independent of the analysis resolution.
 
 mod detect;
+mod frame;
 mod geometry;
 
 pub use detect::{DetectorConfig, detect_document, detect_document_with};
+pub use frame::{FrameError, LIVE_ANALYSIS_SIZE, LumaFrame, detect_document_in_frame};
 pub use geometry::{Point, Quad};
 
 /// A detected document outline.
