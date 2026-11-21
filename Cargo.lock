@@ -227,9 +227,13 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "core-ffi"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "document-engine",
+ "image",
+ "image-engine",
+ "imageproc",
+ "scanner-engine",
  "storage-engine",
  "tempfile",
  "thiserror",
@@ -256,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "document-engine"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -465,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "image-engine"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "image",
  "imageproc",
@@ -898,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "scanner-engine"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "image",
  "imageproc",
@@ -1052,12 +1056,13 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage-engine"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "document-engine",
  "rusqlite",
  "tempfile",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -1199,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "uniffi",
 ]

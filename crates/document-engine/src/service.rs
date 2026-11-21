@@ -1,31 +1,34 @@
 use std::path::Path;
 
 use crate::clock::Clock;
-use crate::error::DocumentError;
-use crate::model::{Document, DocumentId, ImageFormat, NewPage, Page, PageId};
-use crate::ports::{DocumentRepository, PageFileStore};
+use crate::error::{DocumentError, ProcessingError};
+use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageId};
+use crate::ports::{CornerDetection, DocumentRepository, PageFileStore, PageProcessor};
 
 /// Maximum length of a document title, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
 
 /// Document use cases, independent of storage technology and platform.
 #[derive(Debug)]
-pub struct DocumentService<R, F, C> {
+pub struct DocumentService<R, F, P, C> {
     repository: R,
     files: F,
+    processor: P,
     clock: C,
 }
 
-impl<R, F, C> DocumentService<R, F, C>
+impl<R, F, P, C> DocumentService<R, F, P, C>
 where
     R: DocumentRepository,
     F: PageFileStore,
+    P: PageProcessor,
     C: Clock,
 {
-    pub fn new(repository: R, files: F, clock: C) -> Self {
+    pub fn new(repository: R, files: F, processor: P, clock: C) -> Self {
         Self {
             repository,
             files,
+            processor,
             clock,
         }
     }
@@ -93,6 +96,71 @@ where
         }
         Ok(self.repository.list_pages(document_id)?)
     }
+
+    pub fn get_page(&self, page_id: PageId) -> Result<Page, DocumentError> {
+        self.repository
+            .get_page(page_id)?
+            .ok_or(DocumentError::PageNotFound(page_id))
+    }
+
+    /// Looks for the page outline in the page's original image. `Ok(None)`
+    /// means nothing document-like was found; the user picks the corners.
+    pub fn detect_corners(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<CornerDetection>, DocumentError> {
+        let page = self.get_page(page_id)?;
+        let original = self.files.resolve(&page.original_path);
+        self.processor
+            .detect_corners(&original)
+            .map_err(|e| processing_error(e, &page))
+    }
+
+    /// Crops the page to `crop` and stores the perspective-corrected image,
+    /// replacing any previous crop. The original image is never modified,
+    /// so a page can be re-cropped any number of times.
+    ///
+    /// The new image goes to a fresh path and the database is updated only
+    /// after it is fully written; the previous processed image is deleted
+    /// last. A failure at any step leaves the page exactly as it was.
+    pub fn crop_page(&self, page_id: PageId, crop: Crop) -> Result<Page, DocumentError> {
+        let page = self.get_page(page_id)?;
+        let original = self.files.resolve(&page.original_path);
+        let processed = self.files.new_processed_path(page.document_id, page.id);
+
+        self.processor
+            .render_crop(&original, &crop, &self.files.resolve(&processed))
+            .map_err(|e| processing_error(e, &page))?;
+
+        let updated = self
+            .repository
+            .set_page_crop(page.id, &crop, &processed, self.clock.now_ms())
+            .map_err(|err| {
+                let _ = self.files.remove_file(&processed);
+                DocumentError::from(err)
+            })?;
+
+        if let Some(previous) = page.processed_path {
+            // Best effort: an orphan here only wastes space until cleanup.
+            let _ = self.files.remove_file(&previous);
+        }
+        Ok(updated)
+    }
+}
+
+fn processing_error(error: ProcessingError, page: &Page) -> DocumentError {
+    match error {
+        ProcessingError::UnsupportedFormat => DocumentError::UnsupportedImageFormat {
+            extension: page
+                .original_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+        },
+        ProcessingError::InvalidCorners(reason) => DocumentError::InvalidCorners { reason },
+        ProcessingError::Failed(port) => DocumentError::Storage(port),
+    }
 }
 
 fn normalize_title(title: &str) -> Result<String, DocumentError> {
@@ -118,7 +186,7 @@ fn normalize_title(title: &str) -> Result<String, DocumentError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -137,6 +205,7 @@ mod tests {
         docs: Mutex<HashMap<DocumentId, Document>>,
         pages: Mutex<Vec<Page>>,
         fail_append: bool,
+        fail_set_crop: bool,
     }
 
     impl DocumentRepository for InMemoryRepo {
@@ -161,6 +230,8 @@ mod tests {
                 document_id: p.document_id,
                 position: d.page_count,
                 original_path: p.original_path.clone(),
+                crop: None,
+                processed_path: None,
                 created_at_ms: p.created_at_ms,
             };
             d.page_count += 1;
@@ -178,11 +249,39 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        fn get_page(&self, id: PageId) -> Result<Option<Page>, PortError> {
+            Ok(self
+                .pages
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|p| p.id == id)
+                .cloned())
+        }
+        fn set_page_crop(
+            &self,
+            id: PageId,
+            crop: &Crop,
+            processed_path: &Path,
+            _updated_at_ms: i64,
+        ) -> Result<Page, PortError> {
+            if self.fail_set_crop {
+                return Err(PortError::new("set_page_crop", "simulated failure"));
+            }
+            let mut pages = self.pages.lock().unwrap();
+            let page = pages.iter_mut().find(|p| p.id == id).unwrap();
+            page.crop = Some(*crop);
+            page.processed_path = Some(processed_path.to_path_buf());
+            Ok(page.clone())
+        }
     }
 
+    /// Tracks which processed files "exist", to check cleanup.
     #[derive(Default)]
     struct FakeFiles {
-        removed: Mutex<Vec<PageId>>,
+        removed_pages: Mutex<Vec<PageId>>,
+        processed: Mutex<HashSet<PathBuf>>,
+        counter: Mutex<u32>,
     }
 
     impl PageFileStore for FakeFiles {
@@ -195,8 +294,17 @@ mod tests {
         ) -> Result<PathBuf, PortError> {
             Ok(PathBuf::from(format!("{d}/{p}.{}", f.extension())))
         }
+        fn new_processed_path(&self, d: DocumentId, p: PageId) -> PathBuf {
+            let mut counter = self.counter.lock().unwrap();
+            *counter += 1;
+            PathBuf::from(format!("{d}/{p}/processed-{counter}.jpg"))
+        }
+        fn remove_file(&self, relative: &Path) -> Result<(), PortError> {
+            self.processed.lock().unwrap().remove(relative);
+            Ok(())
+        }
         fn remove_page_files(&self, _d: DocumentId, p: PageId) -> Result<(), PortError> {
-            self.removed.lock().unwrap().push(p);
+            self.removed_pages.lock().unwrap().push(p);
             Ok(())
         }
         fn resolve(&self, relative: &Path) -> PathBuf {
@@ -204,8 +312,43 @@ mod tests {
         }
     }
 
-    fn service(repo: InMemoryRepo) -> DocumentService<InMemoryRepo, FakeFiles, FixedClock> {
-        DocumentService::new(repo, FakeFiles::default(), FixedClock(1_000))
+    /// "Renders" by recording the output path in the shared file set.
+    #[derive(Default)]
+    struct FakeProcessor {
+        files: std::sync::Arc<Mutex<HashSet<PathBuf>>>,
+        detection: Option<CornerDetection>,
+        fail_render: Option<fn() -> ProcessingError>,
+    }
+
+    impl PageProcessor for FakeProcessor {
+        fn detect_corners(
+            &self,
+            _original: &Path,
+        ) -> Result<Option<CornerDetection>, ProcessingError> {
+            Ok(self.detection)
+        }
+        fn render_crop(
+            &self,
+            _original: &Path,
+            _crop: &Crop,
+            output: &Path,
+        ) -> Result<(), ProcessingError> {
+            if let Some(fail) = self.fail_render {
+                return Err(fail());
+            }
+            self.files.lock().unwrap().insert(output.to_path_buf());
+            Ok(())
+        }
+    }
+
+    type TestService = DocumentService<InMemoryRepo, FakeFiles, FakeProcessor, FixedClock>;
+
+    fn service(repo: InMemoryRepo) -> TestService {
+        service_with(repo, FakeProcessor::default())
+    }
+
+    fn service_with(repo: InMemoryRepo, processor: FakeProcessor) -> TestService {
+        DocumentService::new(repo, FakeFiles::default(), processor, FixedClock(1_000))
     }
 
     fn temp_image(name: &str) -> (tempfile::TempDir, PathBuf) {
@@ -213,6 +356,10 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, b"fake").unwrap();
         (dir, path)
+    }
+
+    fn crop() -> Crop {
+        Crop::new([(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]).unwrap()
     }
 
     #[test]
@@ -247,6 +394,7 @@ mod tests {
 
         assert_eq!((p0.position, p1.position), (0, 1));
         assert!(p0.original_path.to_string_lossy().ends_with(".jpg"));
+        assert_eq!(p0.processed_path, None);
         assert_eq!(svc.list_pages(doc.id).unwrap().len(), 2);
     }
 
@@ -282,6 +430,81 @@ mod tests {
         let (_dir, img) = temp_image("scan.png");
 
         assert!(svc.add_page(doc.id, &img).is_err());
-        assert_eq!(svc.files().removed.lock().unwrap().len(), 1);
+        assert_eq!(svc.files().removed_pages.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn crop_rejects_coordinates_outside_the_image() {
+        assert!(Crop::new([(0.0, 0.0), (1.1, 0.0), (1.0, 1.0), (0.0, 1.0)]).is_err());
+        assert!(Crop::new([(f32::NAN, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]).is_err());
+    }
+
+    #[test]
+    fn detect_corners_reports_missing_pages() {
+        let svc = service(InMemoryRepo::default());
+        assert!(matches!(
+            svc.detect_corners(PageId::new()),
+            Err(DocumentError::PageNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn crop_page_records_the_crop_and_replaces_the_previous_image() {
+        let processor = FakeProcessor::default();
+        let rendered = processor.files.clone();
+        let svc = service_with(InMemoryRepo::default(), processor);
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+
+        let first = svc.crop_page(page.id, crop()).unwrap();
+        let first_path = first.processed_path.clone().unwrap();
+        assert_eq!(first.crop, Some(crop()));
+
+        // The fake file store and processor share no state, so mirror the
+        // rendered file into the store's view to observe its removal.
+        svc.files()
+            .processed
+            .lock()
+            .unwrap()
+            .insert(first_path.clone());
+        let second = svc.crop_page(page.id, crop()).unwrap();
+
+        assert_ne!(second.processed_path, Some(first_path.clone()));
+        assert!(!svc.files().processed.lock().unwrap().contains(&first_path));
+        assert_eq!(rendered.lock().unwrap().len(), 2);
+        assert_eq!(svc.get_page(page.id).unwrap(), second);
+    }
+
+    #[test]
+    fn crop_page_keeps_the_page_unchanged_when_saving_fails() {
+        let repo = InMemoryRepo {
+            fail_set_crop: true,
+            ..Default::default()
+        };
+        let svc = service(repo);
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+
+        assert!(svc.crop_page(page.id, crop()).is_err());
+        assert_eq!(svc.get_page(page.id).unwrap().processed_path, None);
+    }
+
+    #[test]
+    fn crop_page_maps_processor_errors() {
+        let processor = FakeProcessor {
+            fail_render: Some(|| ProcessingError::UnsupportedFormat),
+            ..Default::default()
+        };
+        let svc = service_with(InMemoryRepo::default(), processor);
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("photo.heic");
+        let page = svc.add_page(doc.id, &img).unwrap();
+
+        let err = svc.crop_page(page.id, crop()).unwrap_err();
+        assert!(
+            matches!(err, DocumentError::UnsupportedImageFormat { extension } if extension == "heic")
+        );
     }
 }

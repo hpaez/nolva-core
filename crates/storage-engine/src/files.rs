@@ -61,6 +61,19 @@ impl PageFileStore for LocalPageFileStore {
         Ok(dir_rel.join(file_name))
     }
 
+    fn new_processed_path(&self, document_id: DocumentId, page_id: PageId) -> PathBuf {
+        Self::page_dir_relative(document_id, page_id)
+            .join(format!("processed-{}.jpg", uuid::Uuid::new_v4().simple()))
+    }
+
+    fn remove_file(&self, relative: &Path) -> Result<(), PortError> {
+        match fs::remove_file(self.root.join(relative)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PortError::new("remove file", e)),
+        }
+    }
+
     fn remove_page_files(&self, document_id: DocumentId, page_id: PageId) -> Result<(), PortError> {
         let dir = self
             .root
@@ -104,6 +117,26 @@ mod tests {
         assert!(!store.resolve(&rel).exists());
         // Idempotent.
         store.remove_page_files(d, p).unwrap();
+    }
+
+    #[test]
+    fn processed_paths_are_unique_and_inside_the_page_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalPageFileStore::new(root.path()).unwrap();
+        let (d, p) = (DocumentId::new(), PageId::new());
+
+        let a = store.new_processed_path(d, p);
+        let b = store.new_processed_path(d, p);
+
+        assert_ne!(a, b);
+        assert!(a.starts_with(LocalPageFileStore::page_dir_relative(d, p)));
+        assert_eq!(a.extension().unwrap(), "jpg");
+
+        fs::create_dir_all(store.resolve(&a).parent().unwrap()).unwrap();
+        fs::write(store.resolve(&a), b"jpeg").unwrap();
+        store.remove_file(&a).unwrap();
+        assert!(!store.resolve(&a).exists());
+        store.remove_file(&a).unwrap(); // idempotent
     }
 
     #[test]
