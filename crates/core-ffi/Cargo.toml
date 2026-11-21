@@ -17,6 +17,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 document-engine.workspace = true
 image-engine.workspace = true
+pdf-engine.workspace = true
 scanner-engine.workspace = true
 storage-engine.workspace = true
 thiserror.workspace = true
@@ -24,6 +25,7 @@ uniffi.workspace = true
 
 [dev-dependencies]
 image = { workspace = true, features = ["png"] }
+lopdf = "0.47"
 imageproc.workspace = true
 tempfile.workspace = true
 

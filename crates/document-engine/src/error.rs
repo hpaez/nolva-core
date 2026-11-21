@@ -53,6 +53,9 @@ pub enum DocumentError {
     #[error("page not found: {0}")]
     PageNotFound(PageId),
 
+    #[error("document has no pages: {0}")]
+    EmptyDocument(DocumentId),
+
     #[error("invalid corners: {reason}")]
     InvalidCorners { reason: String },
 

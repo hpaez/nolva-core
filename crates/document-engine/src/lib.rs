@@ -14,5 +14,8 @@ mod service;
 pub use clock::{Clock, SystemClock};
 pub use error::{DocumentError, PortError, ProcessingError};
 pub use model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageId};
-pub use ports::{CornerDetection, DocumentRepository, PageFileStore, PageProcessor};
+pub use ports::{
+    CornerDetection, DocumentExporter, DocumentRepository, ExportSummary, PageFileStore,
+    PageProcessor, PaperSize, PdfExportOptions,
+};
 pub use service::{DocumentService, MAX_TITLE_CHARS};

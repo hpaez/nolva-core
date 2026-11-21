@@ -1,0 +1,22 @@
+[package]
+name = "pdf-engine"
+description = "PDF generation for Nolva: multi-page PDFs from page images."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+image = { workspace = true, features = ["jpeg"] }
+image-engine.workspace = true
+pdf-writer.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+image = { workspace = true, features = ["jpeg", "png"] }
+lopdf = "0.47"
+tempfile.workspace = true
+
+[lints]
+workspace = true

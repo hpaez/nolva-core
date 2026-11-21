@@ -13,13 +13,13 @@ use std::sync::Arc;
 
 use document_engine::{
     Crop, Document, DocumentError, DocumentId, DocumentService, Page, PageFileStore, PageId,
-    SystemClock,
+    PdfExportOptions, SystemClock,
 };
 use storage_engine::{DATABASE_FILE_NAME, LocalPageFileStore, SqliteDocumentRepository};
 
 mod processor;
 
-use processor::ImagePageProcessor;
+use processor::{ImagePageProcessor, PdfDocumentExporter};
 
 uniffi::setup_scaffolding!();
 
@@ -89,6 +89,30 @@ pub struct CornerDetection {
     pub confidence: f32,
 }
 
+/// Paper size for exported PDFs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PaperSize {
+    /// Each page takes the proportions of its image (good for receipts).
+    FitImage,
+    A4,
+    Letter,
+    /// 8.5 × 14 in, the usual "oficio".
+    Legal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct PdfOptions {
+    pub paper_size: PaperSize,
+    /// White margin around each image on fixed-size pages, in millimetres.
+    pub margin_mm: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PdfExportInfo {
+    pub page_count: u32,
+    pub size_bytes: u64,
+}
+
 /// Errors surfaced to Swift (`throws`) and Kotlin (exceptions).
 ///
 /// `reason` is for logs and diagnostics, not for end users: map the variant
@@ -112,7 +136,8 @@ impl From<DocumentError> for NolvaError {
         match err {
             DocumentError::InvalidTitle { .. }
             | DocumentError::InvalidId { .. }
-            | DocumentError::InvalidCorners { .. } => Self::InvalidArgument { reason },
+            | DocumentError::InvalidCorners { .. }
+            | DocumentError::EmptyDocument(_) => Self::InvalidArgument { reason },
             DocumentError::DocumentNotFound(_)
             | DocumentError::PageNotFound(_)
             | DocumentError::SourceImageNotFound(_) => Self::NotFound { reason },
@@ -122,8 +147,13 @@ impl From<DocumentError> for NolvaError {
     }
 }
 
-type Service =
-    DocumentService<SqliteDocumentRepository, LocalPageFileStore, ImagePageProcessor, SystemClock>;
+type Service = DocumentService<
+    SqliteDocumentRepository,
+    LocalPageFileStore,
+    ImagePageProcessor,
+    PdfDocumentExporter,
+    SystemClock,
+>;
 
 /// Entry point of the core. Create one per process and share it.
 #[derive(Debug, uniffi::Object)]
@@ -145,7 +175,13 @@ impl NolvaCore {
         let repository = SqliteDocumentRepository::open(&data_dir.join(DATABASE_FILE_NAME))
             .map_err(storage_error)?;
         Ok(Arc::new(Self {
-            service: DocumentService::new(repository, files, ImagePageProcessor, SystemClock),
+            service: DocumentService::new(
+                repository,
+                files,
+                ImagePageProcessor,
+                PdfDocumentExporter,
+                SystemClock,
+            ),
         }))
     }
 
@@ -182,6 +218,38 @@ impl NolvaCore {
             .into_iter()
             .map(|p| self.page_info(p))
             .collect())
+    }
+
+    /// Writes the document as a PDF to `output_path` (absolute; its folder
+    /// must exist), one page per page, preferring cropped images. The file
+    /// appears only once complete. Call off the main thread.
+    pub fn export_pdf(
+        &self,
+        document_id: String,
+        output_path: String,
+        options: PdfOptions,
+    ) -> Result<PdfExportInfo, NolvaError> {
+        let id: DocumentId = document_id.parse()?;
+        let output = PathBuf::from(output_path);
+        if !output.is_absolute() {
+            return Err(NolvaError::InvalidArgument {
+                reason: "output_path must be absolute".into(),
+            });
+        }
+        let options = PdfExportOptions {
+            paper_size: match options.paper_size {
+                PaperSize::FitImage => document_engine::PaperSize::FitImage,
+                PaperSize::A4 => document_engine::PaperSize::A4,
+                PaperSize::Letter => document_engine::PaperSize::Letter,
+                PaperSize::Legal => document_engine::PaperSize::Legal,
+            },
+            margin_mm: options.margin_mm,
+        };
+        let summary = self.service.export_pdf(id, &output, &options)?;
+        Ok(PdfExportInfo {
+            page_count: summary.page_count,
+            size_bytes: summary.size_bytes,
+        })
     }
 
     pub fn get_page(&self, page_id: String) -> Result<PageInfo, NolvaError> {
@@ -415,6 +483,62 @@ mod tests {
             ));
         }
         assert_eq!(core.get_page(page.id).unwrap().processed_path, None);
+    }
+
+    #[test]
+    fn exports_a_pdf_with_cropped_and_plain_pages() {
+        let data = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Contrato".into()).unwrap();
+        let photo = photo_of_tilted_sheet(src.path())
+            .to_string_lossy()
+            .into_owned();
+        let first = core.add_page(doc.id.clone(), photo.clone()).unwrap();
+        core.add_page(doc.id.clone(), photo).unwrap();
+        let corners = core
+            .detect_page_corners(first.id.clone())
+            .unwrap()
+            .unwrap()
+            .corners;
+        core.crop_page(first.id, corners).unwrap();
+        let output = src.path().join("contrato.pdf");
+
+        let info = core
+            .export_pdf(
+                doc.id,
+                output.to_string_lossy().into(),
+                PdfOptions {
+                    paper_size: PaperSize::A4,
+                    margin_mm: 5.0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(info.page_count, 2);
+        let pdf = lopdf::Document::load(&output).unwrap();
+        assert_eq!(pdf.get_pages().len(), 2);
+    }
+
+    #[test]
+    fn exporting_an_empty_document_is_an_invalid_argument() {
+        let data = tempfile::tempdir().unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Vacío".into()).unwrap();
+        let output = data.path().join("x.pdf").to_string_lossy().into_owned();
+        let options = PdfOptions {
+            paper_size: PaperSize::FitImage,
+            margin_mm: 0.0,
+        };
+
+        assert!(matches!(
+            core.export_pdf(doc.id.clone(), output, options),
+            Err(NolvaError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            core.export_pdf(doc.id, "relative.pdf".into(), options),
+            Err(NolvaError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

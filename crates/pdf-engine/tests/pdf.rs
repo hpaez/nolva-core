@@ -1,0 +1,214 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::fs;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+
+use image::codecs::jpeg::JpegEncoder;
+use image::{GrayImage, Luma, Rgb, RgbImage};
+use lopdf::{Document, Object, ObjectId};
+use pdf_engine::{PageSize, PdfError, PdfOptions, write_pdf};
+
+fn write_jpeg(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
+    let path = dir.join(name);
+    RgbImage::from_pixel(width, height, Rgb([200, 60, 40]))
+        .save(&path)
+        .unwrap();
+    path
+}
+
+/// A JPEG with an EXIF "rotate 90° clockwise" tag, like phone portraits.
+fn write_rotated_jpeg(dir: &Path, width: u32, height: u32) -> PathBuf {
+    let mut jpeg = Vec::new();
+    JpegEncoder::new(Cursor::new(&mut jpeg))
+        .encode_image(&RgbImage::from_pixel(width, height, Rgb([10, 120, 200])))
+        .unwrap();
+    #[rustfmt::skip]
+    let tiff: [u8; 26] = [
+        b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00,
+        0x01, 0x00,
+        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut app1 = vec![0xFF, 0xE1];
+    app1.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+    app1.extend_from_slice(b"Exif\0\0");
+    app1.extend_from_slice(&tiff);
+    let mut out = jpeg[..2].to_vec();
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&jpeg[2..]);
+
+    let path = dir.join("rotated.jpg");
+    fs::write(&path, out).unwrap();
+    path
+}
+
+fn media_box(doc: &Document, page: ObjectId) -> (f32, f32) {
+    let dict = doc.get_dictionary(page).unwrap();
+    let rect = dict.get(b"MediaBox").unwrap().as_array().unwrap();
+    let num = |o: &Object| {
+        o.as_float()
+            .or_else(|_| o.as_i64().map(|v| v as f32))
+            .unwrap()
+    };
+    (num(&rect[2]), num(&rect[3]))
+}
+
+/// (width, height, filter) of each page's image, in page order.
+fn page_images(doc: &Document) -> Vec<(i64, i64, String)> {
+    doc.get_pages()
+        .values()
+        .map(|&page| {
+            let image = doc
+                .get_page_images(page)
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("page without image");
+            let filter = image.filters.unwrap_or_default().join(",");
+            (image.width, image.height, filter)
+        })
+        .collect()
+}
+
+#[test]
+fn writes_one_page_per_image_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = vec![
+        write_jpeg(dir.path(), "a.jpg", 600, 800),
+        write_jpeg(dir.path(), "b.jpg", 800, 600),
+        write_jpeg(dir.path(), "c.jpg", 300, 400),
+    ];
+    let output = dir.path().join("out.pdf");
+
+    let summary = write_pdf("Contrato", &images, &PdfOptions::default(), &output).unwrap();
+
+    assert_eq!(summary.page_count, 3);
+    assert_eq!(summary.size_bytes, fs::metadata(&output).unwrap().len());
+    let doc = Document::load(&output).unwrap();
+    assert_eq!(doc.get_pages().len(), 3);
+    let pages: Vec<_> = doc.get_pages().values().copied().collect();
+    // A4 portrait, A4 landscape, A4 portrait.
+    let (w0, h0) = media_box(&doc, pages[0]);
+    let (w1, h1) = media_box(&doc, pages[1]);
+    assert!((w0 - 595.28).abs() < 0.1 && (h0 - 841.89).abs() < 0.1);
+    assert!(w1 > h1);
+    assert_eq!(
+        page_images(&doc)
+            .iter()
+            .map(|(w, h, _)| (*w, *h))
+            .collect::<Vec<_>>(),
+        vec![(600, 800), (800, 600), (300, 400)]
+    );
+}
+
+#[test]
+fn embeds_upright_jpegs_without_recompressing() {
+    let dir = tempfile::tempdir().unwrap();
+    let jpeg = write_jpeg(dir.path(), "page.jpg", 640, 480);
+    let output = dir.path().join("out.pdf");
+
+    write_pdf(
+        "x",
+        std::slice::from_ref(&jpeg),
+        &PdfOptions::default(),
+        &output,
+    )
+    .unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let page = *doc.get_pages().values().next().unwrap();
+    let image = doc.get_page_images(page).unwrap().remove(0);
+    assert_eq!(image.filters.unwrap(), vec!["DCTDecode".to_string()]);
+    assert_eq!(
+        image.content,
+        fs::read(&jpeg).unwrap().as_slice(),
+        "JPEG was re-encoded"
+    );
+}
+
+#[test]
+fn applies_exif_rotation_because_pdf_viewers_ignore_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // Stored 400×200 (sensor), meant to be seen 200×400 (portrait).
+    let photo = write_rotated_jpeg(dir.path(), 400, 200);
+    let output = dir.path().join("out.pdf");
+
+    write_pdf("x", &[photo], &PdfOptions::default(), &output).unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    assert_eq!(page_images(&doc), vec![(200, 400, "DCTDecode".to_string())]);
+    let page = *doc.get_pages().values().next().unwrap();
+    let (w, h) = media_box(&doc, page);
+    assert!(h > w, "portrait photo should get a portrait page");
+}
+
+#[test]
+fn converts_png_and_keeps_grayscale() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = dir.path().join("scan.png");
+    GrayImage::from_pixel(300, 400, Luma([180]))
+        .save(&png)
+        .unwrap();
+    let output = dir.path().join("out.pdf");
+
+    write_pdf("x", &[png], &PdfOptions::default(), &output).unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let page = *doc.get_pages().values().next().unwrap();
+    let image = doc.get_page_images(page).unwrap().remove(0);
+    assert_eq!((image.width, image.height), (300, 400));
+    assert_eq!(image.color_space.as_deref(), Some("DeviceGray"));
+}
+
+#[test]
+fn fit_image_pages_follow_the_image_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let receipt = write_jpeg(dir.path(), "receipt.jpg", 300, 1200);
+    let output = dir.path().join("out.pdf");
+    let options = PdfOptions {
+        page_size: PageSize::FitImage,
+        margin_mm: 0.0,
+    };
+
+    write_pdf("x", &[receipt], &options, &output).unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let page = *doc.get_pages().values().next().unwrap();
+    let (w, h) = media_box(&doc, page);
+    assert!((h / w - 4.0).abs() < 0.01);
+}
+
+#[test]
+fn sets_the_document_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    write_pdf(
+        "Factura de luz",
+        &[write_jpeg(dir.path(), "a.jpg", 10, 10)],
+        &PdfOptions::default(),
+        &output,
+    )
+    .unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let info_ref = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+    let title = doc.get_dictionary(info_ref).unwrap().get(b"Title").unwrap();
+    assert_eq!(lopdf::decode_text_string(title).unwrap(), "Factura de luz");
+}
+
+#[test]
+fn rejects_empty_documents_and_leaves_no_partial_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+
+    assert!(matches!(
+        write_pdf("x", &[], &PdfOptions::default(), &output),
+        Err(PdfError::NoPages)
+    ));
+
+    let missing = dir.path().join("missing.jpg");
+    assert!(write_pdf("x", &[missing], &PdfOptions::default(), &output).is_err());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}

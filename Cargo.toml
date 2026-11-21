@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/document-engine",
     "crates/image-engine",
+    "crates/pdf-engine",
     "crates/scanner-engine",
     "crates/storage-engine",
     "crates/core-ffi",
@@ -10,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "UNLICENSED"
@@ -20,12 +21,14 @@ publish = false
 [workspace.dependencies]
 document-engine = { path = "crates/document-engine" }
 image-engine = { path = "crates/image-engine" }
+pdf-engine = { path = "crates/pdf-engine" }
 scanner-engine = { path = "crates/scanner-engine" }
 storage-engine = { path = "crates/storage-engine" }
 
 # Image crates: codecs are opted into per crate; core types need none.
 image = { version = "0.25", default-features = false }
 imageproc = { version = "0.27", default-features = false }
+pdf-writer = "0.15"
 rusqlite = { version = "0.43", features = ["bundled"] }
 thiserror = "2"
 uniffi = "0.32"
