@@ -52,6 +52,7 @@ where
             created_at_ms: now,
             updated_at_ms: now,
             page_count: 0,
+            cover_path: None,
         };
         self.repository.insert_document(&document)?;
         Ok(document)

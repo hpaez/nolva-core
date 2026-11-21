@@ -45,6 +45,9 @@ pub struct DocumentInfo {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub page_count: u32,
+    /// Absolute path of the first page's image (processed if it has one),
+    /// for thumbnails. `None` while the document has no pages.
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -223,7 +226,7 @@ impl NolvaCore {
     }
 
     pub fn create_document(&self, title: String) -> Result<DocumentInfo, NolvaError> {
-        Ok(self.service.create_document(&title)?.into())
+        Ok(self.document_info(self.service.create_document(&title)?))
     }
 
     pub fn list_documents(&self) -> Result<Vec<DocumentInfo>, NolvaError> {
@@ -231,7 +234,7 @@ impl NolvaCore {
             .service
             .list_documents()?
             .into_iter()
-            .map(Into::into)
+            .map(|d| self.document_info(d))
             .collect())
     }
 
@@ -241,7 +244,7 @@ impl NolvaCore {
         title: String,
     ) -> Result<DocumentInfo, NolvaError> {
         let id: DocumentId = document_id.parse()?;
-        Ok(self.service.rename_document(id, &title)?.into())
+        Ok(self.document_info(self.service.rename_document(id, &title)?))
     }
 
     /// Permanently deletes a document, its pages and all their images.
@@ -368,6 +371,20 @@ impl NolvaCore {
 }
 
 impl NolvaCore {
+    fn document_info(&self, d: Document) -> DocumentInfo {
+        let files = self.service.files();
+        DocumentInfo {
+            id: d.id.to_string(),
+            title: d.title,
+            created_at_ms: d.created_at_ms,
+            updated_at_ms: d.updated_at_ms,
+            page_count: d.page_count,
+            cover_path: d
+                .cover_path
+                .map(|p| files.resolve(&p).to_string_lossy().into_owned()),
+        }
+    }
+
     fn page_info(&self, page: Page) -> PageInfo {
         let files = self.service.files();
         let absolute = |p: &std::path::Path| files.resolve(p).to_string_lossy().into_owned();
@@ -380,18 +397,6 @@ impl NolvaCore {
             corners: page.crop.map(PageCorners::from),
             filter: page.filter.into(),
             created_at_ms: page.created_at_ms,
-        }
-    }
-}
-
-impl From<Document> for DocumentInfo {
-    fn from(d: Document) -> Self {
-        Self {
-            id: d.id.to_string(),
-            title: d.title,
-            created_at_ms: d.created_at_ms,
-            updated_at_ms: d.updated_at_ms,
-            page_count: d.page_count,
         }
     }
 }
@@ -712,10 +717,13 @@ mod tests {
             .map(|_| core.add_page(doc.id.clone(), photo.clone()).unwrap())
             .collect();
 
+        assert_eq!(doc.cover_path, None);
         let renamed = core
             .rename_document(doc.id.clone(), "Contrato".into())
             .unwrap();
         assert_eq!(renamed.title, "Contrato");
+        assert_eq!(renamed.cover_path.as_ref(), Some(&pages[0].original_path));
+        assert!(Path::new(renamed.cover_path.as_ref().unwrap()).is_absolute());
 
         let order = core.move_page(pages[2].id.clone(), 0).unwrap();
         assert_eq!(

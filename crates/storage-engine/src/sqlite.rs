@@ -61,7 +61,9 @@ impl SqliteDocumentRepository {
 }
 
 const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.created_at_ms, d.updated_at_ms, \
-     (SELECT COUNT(*) FROM pages p WHERE p.document_id = d.id)";
+     (SELECT COUNT(*) FROM pages p WHERE p.document_id = d.id), \
+     (SELECT COALESCE(p.processed_path, p.original_path) FROM pages p \
+      WHERE p.document_id = d.id ORDER BY p.position LIMIT 1)";
 
 fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
     Ok(Document {
@@ -70,6 +72,7 @@ fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
         created_at_ms: row.get(2)?,
         updated_at_ms: row.get(3)?,
         page_count: row.get(4)?,
+        cover_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
     })
 }
 
@@ -464,6 +467,7 @@ mod tests {
             created_at_ms: updated,
             updated_at_ms: updated,
             page_count: 0,
+            cover_path: None,
         }
     }
 
@@ -591,6 +595,32 @@ mod tests {
                 .unwrap();
             assert_eq!(repo.get_page(page.id).unwrap().unwrap().filter, filter);
         }
+    }
+
+    #[test]
+    fn documents_carry_their_first_page_as_cover() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        assert_eq!(repo.get_document(d.id).unwrap().unwrap().cover_path, None);
+
+        let first = repo.append_page(&new_page(d.id, 2)).unwrap();
+        let second = repo.append_page(&new_page(d.id, 3)).unwrap();
+        let cover = || repo.list_documents().unwrap()[0].cover_path.clone();
+        assert_eq!(cover(), Some(first.original_path.clone()));
+
+        // The processed image wins, and reordering changes the cover.
+        repo.set_page_rendering(
+            first.id,
+            None,
+            PageFilter::Grayscale,
+            Some(Path::new("p.jpg")),
+            4,
+        )
+        .unwrap();
+        assert_eq!(cover(), Some(PathBuf::from("p.jpg")));
+        repo.move_page(second.id, 0, 5).unwrap();
+        assert_eq!(cover(), Some(second.original_path));
     }
 
     fn ids(pages: &[Page]) -> Vec<PageId> {
