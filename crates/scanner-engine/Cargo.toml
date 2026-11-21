@@ -1,0 +1,15 @@
+[package]
+name = "scanner-engine"
+description = "Document detection: finds the four corners of a page in a photo."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+image.workspace = true
+imageproc.workspace = true
+
+[lints]
+workspace = true
