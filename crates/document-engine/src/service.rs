@@ -3,32 +3,38 @@ use std::path::Path;
 use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
 use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageId};
-use crate::ports::{CornerDetection, DocumentRepository, PageFileStore, PageProcessor};
+use crate::ports::{
+    CornerDetection, DocumentExporter, DocumentRepository, ExportSummary, PageFileStore,
+    PageProcessor, PdfExportOptions,
+};
 
 /// Maximum length of a document title, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
 
 /// Document use cases, independent of storage technology and platform.
 #[derive(Debug)]
-pub struct DocumentService<R, F, P, C> {
+pub struct DocumentService<R, F, P, E, C> {
     repository: R,
     files: F,
     processor: P,
+    exporter: E,
     clock: C,
 }
 
-impl<R, F, P, C> DocumentService<R, F, P, C>
+impl<R, F, P, E, C> DocumentService<R, F, P, E, C>
 where
     R: DocumentRepository,
     F: PageFileStore,
     P: PageProcessor,
+    E: DocumentExporter,
     C: Clock,
 {
-    pub fn new(repository: R, files: F, processor: P, clock: C) -> Self {
+    pub fn new(repository: R, files: F, processor: P, exporter: E, clock: C) -> Self {
         Self {
             repository,
             files,
             processor,
+            exporter,
             clock,
         }
     }
@@ -145,6 +151,41 @@ where
             let _ = self.files.remove_file(&previous);
         }
         Ok(updated)
+    }
+
+    /// Exports the document as a PDF at `output`, one page per page, using
+    /// each page's processed image when it has one and the original otherwise.
+    pub fn export_pdf(
+        &self,
+        document_id: DocumentId,
+        output: &Path,
+        options: &PdfExportOptions,
+    ) -> Result<ExportSummary, DocumentError> {
+        let document = self
+            .repository
+            .get_document(document_id)?
+            .ok_or(DocumentError::DocumentNotFound(document_id))?;
+        let pages = self.repository.list_pages(document_id)?;
+        if pages.is_empty() {
+            return Err(DocumentError::EmptyDocument(document_id));
+        }
+        let images: Vec<_> = pages
+            .iter()
+            .map(|p| {
+                self.files
+                    .resolve(p.processed_path.as_ref().unwrap_or(&p.original_path))
+            })
+            .collect();
+
+        self.exporter
+            .export_pdf(&document.title, &images, options, output)
+            .map_err(|error| match error {
+                ProcessingError::UnsupportedFormat => DocumentError::UnsupportedImageFormat {
+                    extension: "page image".into(),
+                },
+                ProcessingError::InvalidCorners(reason) => DocumentError::InvalidCorners { reason },
+                ProcessingError::Failed(port) => DocumentError::Storage(port),
+            })
     }
 }
 
@@ -341,14 +382,46 @@ mod tests {
         }
     }
 
-    type TestService = DocumentService<InMemoryRepo, FakeFiles, FakeProcessor, FixedClock>;
+    /// Records what it was asked to export.
+    #[derive(Default)]
+    struct FakeExporter {
+        exported: Mutex<Vec<(String, Vec<PathBuf>)>>,
+    }
+
+    impl DocumentExporter for FakeExporter {
+        fn export_pdf(
+            &self,
+            title: &str,
+            images: &[PathBuf],
+            _options: &PdfExportOptions,
+            _output: &Path,
+        ) -> Result<ExportSummary, ProcessingError> {
+            self.exported
+                .lock()
+                .unwrap()
+                .push((title.to_owned(), images.to_vec()));
+            Ok(ExportSummary {
+                page_count: images.len() as u32,
+                size_bytes: 1,
+            })
+        }
+    }
+
+    type TestService =
+        DocumentService<InMemoryRepo, FakeFiles, FakeProcessor, FakeExporter, FixedClock>;
 
     fn service(repo: InMemoryRepo) -> TestService {
         service_with(repo, FakeProcessor::default())
     }
 
     fn service_with(repo: InMemoryRepo, processor: FakeProcessor) -> TestService {
-        DocumentService::new(repo, FakeFiles::default(), processor, FixedClock(1_000))
+        DocumentService::new(
+            repo,
+            FakeFiles::default(),
+            processor,
+            FakeExporter::default(),
+            FixedClock(1_000),
+        )
     }
 
     fn temp_image(name: &str) -> (tempfile::TempDir, PathBuf) {
@@ -506,5 +579,46 @@ mod tests {
         assert!(
             matches!(err, DocumentError::UnsupportedImageFormat { extension } if extension == "heic")
         );
+    }
+
+    const PDF: PdfExportOptions = PdfExportOptions {
+        paper_size: crate::ports::PaperSize::A4,
+        margin_mm: 0.0,
+    };
+
+    #[test]
+    fn export_uses_processed_images_when_available() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Contrato").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let cropped = svc.add_page(doc.id, &img).unwrap();
+        let plain = svc.add_page(doc.id, &img).unwrap();
+        let cropped = svc.crop_page(cropped.id, crop()).unwrap();
+
+        let summary = svc.export_pdf(doc.id, Path::new("/out.pdf"), &PDF).unwrap();
+
+        assert_eq!(summary.page_count, 2);
+        let exported = svc.exporter.exported.lock().unwrap();
+        let (title, images) = &exported[0];
+        assert_eq!(title, "Contrato");
+        assert_eq!(
+            images,
+            &vec![cropped.processed_path.unwrap(), plain.original_path]
+        );
+    }
+
+    #[test]
+    fn export_rejects_empty_or_missing_documents() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Vacío").unwrap();
+
+        assert!(matches!(
+            svc.export_pdf(doc.id, Path::new("/out.pdf"), &PDF),
+            Err(DocumentError::EmptyDocument(_))
+        ));
+        assert!(matches!(
+            svc.export_pdf(DocumentId::new(), Path::new("/out.pdf"), &PDF),
+            Err(DocumentError::DocumentNotFound(_))
+        ));
     }
 }

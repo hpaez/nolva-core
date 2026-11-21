@@ -82,3 +82,39 @@ pub trait PageProcessor: Send + Sync {
         output: &Path,
     ) -> Result<(), ProcessingError>;
 }
+
+/// Paper size for exported PDFs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaperSize {
+    /// Each page takes the proportions of its image.
+    FitImage,
+    A4,
+    Letter,
+    /// 8.5 × 14 in, the usual "oficio".
+    Legal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfExportOptions {
+    pub paper_size: PaperSize,
+    /// White margin on fixed-size pages, in millimetres.
+    pub margin_mm: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportSummary {
+    pub page_count: u32,
+    pub size_bytes: u64,
+}
+
+/// Turns page images into shareable files.
+pub trait DocumentExporter: Send + Sync {
+    /// Writes a PDF with one page per image, in order, to `output` (atomically).
+    fn export_pdf(
+        &self,
+        title: &str,
+        images: &[PathBuf],
+        options: &PdfExportOptions,
+        output: &Path,
+    ) -> Result<ExportSummary, ProcessingError>;
+}

@@ -10,6 +10,7 @@ crates/
   document-engine/   Domain model and use cases (no I/O; defines ports)
   scanner-engine/    Document detection: finds the page corners in a photo
   image-engine/      Oriented decoding, perspective correction, JPEG encoding
+  pdf-engine/        Multi-page PDF export (JPEGs embedded without recompression)
   storage-engine/    SQLite (metadata) + file system (images)
   core-ffi/          Public UniFFI API (lib: nolva_core)
 tools/uniffi-bindgen Bindings generator pinned to the uniffi version
@@ -23,7 +24,7 @@ Crate dependencies: `core-ffi → {storage-engine, image-engine → scanner-engi
 The domain knows nothing about SQLite, image processing or the mobile
 platforms; those are plugged in through ports.
 
-## Current API (v0.2)
+## Current API (v0.3)
 
 ```swift
 let core = try NolvaCore(config: CoreConfig(dataDir: appSupportPath))
@@ -34,6 +35,10 @@ let page = try core.addPage(documentId: doc.id, imagePath: capturedFile.path)
 let corners = try core.detectPageCorners(pageId: page.id)?.corners ?? fullImage
 let cropped = try core.cropPage(pageId: page.id, corners: corners)
 show(cropped.processedPath ?? cropped.originalPath)
+
+// Export: one page per page, cropped images preferred, JPEGs embedded losslessly.
+let info = try core.exportPdf(documentId: doc.id, outputPath: pdfURL.path,
+                              options: PdfOptions(paperSize: .a4, marginMm: 0))
 ```
 
 ```kotlin
@@ -42,6 +47,7 @@ val doc = core.createDocument("Contract")
 val page = core.addPage(doc.id, capturedFile.absolutePath)
 val detection = core.detectPageCorners(page.id)   // null if no sheet found
 val cropped = core.cropPage(page.id, detection?.corners ?: fullImage)
+val info = core.exportPdf(doc.id, pdfFile.absolutePath, PdfOptions(PaperSize.A4, marginMm = 0f))
 ```
 
 Corners are normalized (`0.0..=1.0`) in the coordinates of the original
