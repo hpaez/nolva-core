@@ -24,7 +24,7 @@ Crate dependencies: `core-ffi → {storage-engine, image-engine → scanner-engi
 The domain knows nothing about SQLite, image processing or the mobile
 platforms; those are plugged in through ports.
 
-## Current API (v0.5)
+## Current API (v0.6)
 
 ```swift
 let core = try NolvaCore(config: CoreConfig(dataDir: appSupportPath))
@@ -52,6 +52,9 @@ val detection = core.detectPageCorners(page.id)   // null if no sheet found
 val cropped = core.cropPage(page.id, detection?.corners ?: fullImage)
 val clean = core.setPageFilter(page.id, PageFilter.BLACK_AND_WHITE)
 val info = core.exportPdf(doc.id, pdfFile.absolutePath, PdfOptions(PaperSize.A4, marginMm = 0f))
+
+// Lists carry each document's first page image for thumbnails.
+val covers = core.listDocuments().map { it.coverPath }   // null when empty
 
 // Manage: renames, permanent deletes (files included) and reordering.
 core.renameDocument(doc.id, "Signed contract")

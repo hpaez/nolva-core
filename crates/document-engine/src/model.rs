@@ -60,6 +60,10 @@ pub struct Document {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub page_count: u32,
+    /// Image of the first page (processed if it has one), relative to the
+    /// storage root, for list thumbnails. `None` for empty documents. Derived
+    /// by the repository on read; ignored on insert.
+    pub cover_path: Option<PathBuf>,
 }
 
 /// Page outline chosen for cropping: four corners in normalized coordinates
