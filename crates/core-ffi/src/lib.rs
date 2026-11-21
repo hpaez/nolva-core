@@ -198,6 +198,43 @@ impl NolvaCore {
             .collect())
     }
 
+    pub fn rename_document(
+        &self,
+        document_id: String,
+        title: String,
+    ) -> Result<DocumentInfo, NolvaError> {
+        let id: DocumentId = document_id.parse()?;
+        Ok(self.service.rename_document(id, &title)?.into())
+    }
+
+    /// Permanently deletes a document, its pages and all their images.
+    pub fn delete_document(&self, document_id: String) -> Result<(), NolvaError> {
+        let id: DocumentId = document_id.parse()?;
+        Ok(self.service.delete_document(id)?)
+    }
+
+    /// Permanently deletes a page and its images; later pages move up.
+    pub fn delete_page(&self, page_id: String) -> Result<(), NolvaError> {
+        let id: PageId = page_id.parse()?;
+        Ok(self.service.delete_page(id)?)
+    }
+
+    /// Moves a page to `to_position` (0-based; past the end means last) and
+    /// returns the document's pages in their new order.
+    pub fn move_page(
+        &self,
+        page_id: String,
+        to_position: u32,
+    ) -> Result<Vec<PageInfo>, NolvaError> {
+        let id: PageId = page_id.parse()?;
+        Ok(self
+            .service
+            .move_page(id, to_position)?
+            .into_iter()
+            .map(|p| self.page_info(p))
+            .collect())
+    }
+
     /// Copies the image at `image_path` into Nolva's storage as the last page
     /// of the document. The source file is left untouched.
     pub fn add_page(
@@ -538,6 +575,54 @@ mod tests {
         assert!(matches!(
             core.export_pdf(doc.id, "relative.pdf".into(), options),
             Err(NolvaError::InvalidArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn manage_documents_and_pages_end_to_end() {
+        let data = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Borrador".into()).unwrap();
+        let photo = photo_of_tilted_sheet(src.path())
+            .to_string_lossy()
+            .into_owned();
+        let pages: Vec<_> = (0..3)
+            .map(|_| core.add_page(doc.id.clone(), photo.clone()).unwrap())
+            .collect();
+
+        let renamed = core
+            .rename_document(doc.id.clone(), "Contrato".into())
+            .unwrap();
+        assert_eq!(renamed.title, "Contrato");
+
+        let order = core.move_page(pages[2].id.clone(), 0).unwrap();
+        assert_eq!(
+            order.iter().map(|p| &p.id).collect::<Vec<_>>(),
+            vec![&pages[2].id, &pages[0].id, &pages[1].id]
+        );
+
+        core.delete_page(pages[0].id.clone()).unwrap();
+        assert!(
+            !Path::new(&pages[0].original_path).exists(),
+            "page image must be deleted"
+        );
+        let remaining = core.list_pages(doc.id.clone()).unwrap();
+        assert_eq!(
+            remaining.iter().map(|p| p.position).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        core.delete_document(doc.id.clone()).unwrap();
+        assert!(core.list_documents().unwrap().is_empty());
+        assert!(
+            remaining
+                .iter()
+                .all(|p| !Path::new(&p.original_path).exists())
+        );
+        assert!(matches!(
+            core.delete_document(doc.id),
+            Err(NolvaError::NotFound { .. })
         ));
     }
 

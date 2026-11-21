@@ -61,6 +61,45 @@ where
         Ok(self.repository.list_documents()?)
     }
 
+    pub fn rename_document(&self, id: DocumentId, title: &str) -> Result<Document, DocumentError> {
+        let title = normalize_title(title)?;
+        self.repository
+            .rename_document(id, &title, self.clock.now_ms())?
+            .ok_or(DocumentError::DocumentNotFound(id))
+    }
+
+    /// Deletes a document, its pages and all their images. Permanent.
+    ///
+    /// The database goes first: if file cleanup then fails, the leftovers
+    /// are unreachable orphans (wasted space), never pages pointing at
+    /// missing images.
+    pub fn delete_document(&self, id: DocumentId) -> Result<(), DocumentError> {
+        if !self.repository.delete_document(id)? {
+            return Err(DocumentError::DocumentNotFound(id));
+        }
+        let _ = self.files.remove_document_files(id);
+        Ok(())
+    }
+
+    /// Deletes a page and its images; later pages move up one position.
+    pub fn delete_page(&self, page_id: PageId) -> Result<(), DocumentError> {
+        let page = self.get_page(page_id)?;
+        if !self.repository.delete_page(page_id, self.clock.now_ms())? {
+            return Err(DocumentError::PageNotFound(page_id));
+        }
+        let _ = self.files.remove_page_files(page.document_id, page_id);
+        Ok(())
+    }
+
+    /// Moves a page to `to_position` (0-based, clamped to the document) and
+    /// returns the document's pages in their new order.
+    pub fn move_page(&self, page_id: PageId, to_position: u32) -> Result<Vec<Page>, DocumentError> {
+        self.get_page(page_id)?;
+        Ok(self
+            .repository
+            .move_page(page_id, to_position, self.clock.now_ms())?)
+    }
+
     /// Imports an image file as the last page of a document.
     ///
     /// The source file is copied, never moved: the caller keeps ownership of
@@ -299,6 +338,67 @@ mod tests {
                 .find(|p| p.id == id)
                 .cloned())
         }
+        fn rename_document(
+            &self,
+            id: DocumentId,
+            title: &str,
+            updated_at_ms: i64,
+        ) -> Result<Option<Document>, PortError> {
+            let mut docs = self.docs.lock().unwrap();
+            Ok(docs.get_mut(&id).map(|d| {
+                d.title = title.to_owned();
+                d.updated_at_ms = updated_at_ms;
+                d.clone()
+            }))
+        }
+        fn delete_document(&self, id: DocumentId) -> Result<bool, PortError> {
+            self.pages.lock().unwrap().retain(|p| p.document_id != id);
+            Ok(self.docs.lock().unwrap().remove(&id).is_some())
+        }
+        fn delete_page(&self, id: PageId, _updated_at_ms: i64) -> Result<bool, PortError> {
+            let mut pages = self.pages.lock().unwrap();
+            let Some(index) = pages.iter().position(|p| p.id == id) else {
+                return Ok(false);
+            };
+            let removed = pages.remove(index);
+            renumber(&mut pages, removed.document_id);
+            self.docs
+                .lock()
+                .unwrap()
+                .get_mut(&removed.document_id)
+                .unwrap()
+                .page_count -= 1;
+            Ok(true)
+        }
+        fn move_page(
+            &self,
+            id: PageId,
+            to: u32,
+            _updated_at_ms: i64,
+        ) -> Result<Vec<Page>, PortError> {
+            let mut pages = self.pages.lock().unwrap();
+            let page = pages.iter().find(|p| p.id == id).cloned().unwrap();
+            let mut order: Vec<Page> = pages
+                .iter()
+                .filter(|p| p.document_id == page.document_id)
+                .cloned()
+                .collect();
+            order.sort_by_key(|p| p.position);
+            let from = order.iter().position(|p| p.id == id).unwrap();
+            let moved = order.remove(from);
+            let to = (to as usize).min(order.len());
+            order.insert(to, moved);
+            for (position, p) in order.iter().enumerate() {
+                pages.iter_mut().find(|x| x.id == p.id).unwrap().position = position as u32;
+            }
+            let mut result: Vec<Page> = pages
+                .iter()
+                .filter(|p| p.document_id == page.document_id)
+                .cloned()
+                .collect();
+            result.sort_by_key(|p| p.position);
+            Ok(result)
+        }
         fn set_page_crop(
             &self,
             id: PageId,
@@ -317,9 +417,22 @@ mod tests {
         }
     }
 
+    fn renumber(pages: &mut [Page], document_id: DocumentId) {
+        let mut ids: Vec<(u32, PageId)> = pages
+            .iter()
+            .filter(|p| p.document_id == document_id)
+            .map(|p| (p.position, p.id))
+            .collect();
+        ids.sort();
+        for (position, (_, id)) in ids.into_iter().enumerate() {
+            pages.iter_mut().find(|p| p.id == id).unwrap().position = position as u32;
+        }
+    }
+
     /// Tracks which processed files "exist", to check cleanup.
     #[derive(Default)]
     struct FakeFiles {
+        removed_documents: Mutex<Vec<DocumentId>>,
         removed_pages: Mutex<Vec<PageId>>,
         processed: Mutex<HashSet<PathBuf>>,
         counter: Mutex<u32>,
@@ -342,6 +455,10 @@ mod tests {
         }
         fn remove_file(&self, relative: &Path) -> Result<(), PortError> {
             self.processed.lock().unwrap().remove(relative);
+            Ok(())
+        }
+        fn remove_document_files(&self, d: DocumentId) -> Result<(), PortError> {
+            self.removed_documents.lock().unwrap().push(d);
             Ok(())
         }
         fn remove_page_files(&self, _d: DocumentId, p: PageId) -> Result<(), PortError> {
@@ -620,5 +737,91 @@ mod tests {
             svc.export_pdf(DocumentId::new(), Path::new("/out.pdf"), &PDF),
             Err(DocumentError::DocumentNotFound(_))
         ));
+    }
+
+    #[test]
+    fn rename_validates_and_updates_the_title() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Borrador").unwrap();
+
+        let renamed = svc.rename_document(doc.id, "  Contrato final ").unwrap();
+
+        assert_eq!(renamed.title, "Contrato final");
+        assert!(svc.rename_document(doc.id, "   ").is_err());
+        assert!(matches!(
+            svc.rename_document(DocumentId::new(), "x"),
+            Err(DocumentError::DocumentNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_document_removes_pages_and_files() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        svc.add_page(doc.id, &img).unwrap();
+
+        svc.delete_document(doc.id).unwrap();
+
+        assert!(svc.list_documents().unwrap().is_empty());
+        assert_eq!(*svc.files().removed_documents.lock().unwrap(), vec![doc.id]);
+        assert!(matches!(
+            svc.delete_document(doc.id),
+            Err(DocumentError::DocumentNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_page_closes_the_gap() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let pages: Vec<_> = (0..3)
+            .map(|_| svc.add_page(doc.id, &img).unwrap())
+            .collect();
+
+        svc.delete_page(pages[1].id).unwrap();
+
+        let remaining = svc.list_pages(doc.id).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|p| (p.id, p.position))
+                .collect::<Vec<_>>(),
+            vec![(pages[0].id, 0), (pages[2].id, 1)]
+        );
+        assert_eq!(
+            *svc.files().removed_pages.lock().unwrap(),
+            vec![pages[1].id]
+        );
+        assert!(matches!(
+            svc.delete_page(pages[1].id),
+            Err(DocumentError::PageNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn move_page_reorders_and_clamps() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let ids: Vec<_> = (0..4)
+            .map(|_| svc.add_page(doc.id, &img).unwrap().id)
+            .collect();
+
+        let order = svc.move_page(ids[3], 0).unwrap();
+        assert_eq!(
+            order.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![ids[3], ids[0], ids[1], ids[2]]
+        );
+
+        let order = svc.move_page(ids[3], 99).unwrap();
+        assert_eq!(order.iter().map(|p| p.id).collect::<Vec<_>>(), ids);
+        assert!(
+            order
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.position == i as u32)
+        );
     }
 }

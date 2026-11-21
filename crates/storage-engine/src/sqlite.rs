@@ -4,7 +4,9 @@ use std::sync::{Mutex, MutexGuard};
 use document_engine::{
     Crop, Document, DocumentId, DocumentRepository, NewPage, Page, PageId, PortError,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 
 use crate::migrations;
 
@@ -89,6 +91,57 @@ fn page_from_row(row: &Row<'_>) -> rusqlite::Result<Page> {
         processed_path: processed.map(PathBuf::from),
         created_at_ms: row.get(4)?,
     })
+}
+
+fn page_document(tx: &Transaction<'_>, id: PageId) -> rusqlite::Result<Option<String>> {
+    tx.query_row(
+        "SELECT document_id FROM pages WHERE id = ?1",
+        params![id.to_string()],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Page ids of a document in their current order.
+fn page_order(tx: &Transaction<'_>, document_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = tx.prepare("SELECT id FROM pages WHERE document_id = ?1 ORDER BY position")?;
+    stmt.query_map(params![document_id], |r| r.get(0))?
+        .collect()
+}
+
+/// Assigns positions `0..n` following `order`.
+///
+/// `UNIQUE(document_id, position)` is checked row by row, so shifting pages
+/// one slot at a time would collide halfway. Instead, every page first moves
+/// past the current maximum (a range nothing occupies), then each takes its
+/// final slot, which is free by then.
+fn renumber(tx: &Transaction<'_>, document_id: &str, order: &[String]) -> rusqlite::Result<()> {
+    let offset: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position), 0) + 1 FROM pages WHERE document_id = ?1",
+        params![document_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "UPDATE pages SET position = position + ?2 WHERE document_id = ?1",
+        params![document_id, offset],
+    )?;
+    let mut stmt = tx.prepare("UPDATE pages SET position = ?2 WHERE id = ?1")?;
+    for (position, id) in order.iter().enumerate() {
+        stmt.execute(params![id, position as i64])?;
+    }
+    Ok(())
+}
+
+fn touch_document(
+    tx: &Transaction<'_>,
+    document_id: &str,
+    updated_at_ms: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE documents SET updated_at_ms = MAX(updated_at_ms, ?2) WHERE id = ?1",
+        params![document_id, updated_at_ms],
+    )?;
+    Ok(())
 }
 
 /// Rust's float `Display` is the shortest string that round-trips exactly.
@@ -234,6 +287,94 @@ impl DocumentRepository for SqliteDocumentRepository {
             )
             .optional()
             .map_err(|e| PortError::new("get page", e))
+    }
+
+    fn rename_document(
+        &self,
+        id: DocumentId,
+        title: &str,
+        updated_at_ms: i64,
+    ) -> Result<Option<Document>, PortError> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE documents SET title = ?2, updated_at_ms = MAX(updated_at_ms, ?3) WHERE id = ?1",
+                params![id.to_string(), title, updated_at_ms],
+            )
+            .map_err(|e| PortError::new("rename document", e))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_document(id)
+    }
+
+    fn delete_document(&self, id: DocumentId) -> Result<bool, PortError> {
+        // Pages go with it: pages.document_id is ON DELETE CASCADE.
+        let changed = self
+            .conn()
+            .execute(
+                "DELETE FROM documents WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .map_err(|e| PortError::new("delete document", e))?;
+        Ok(changed > 0)
+    }
+
+    fn delete_page(&self, id: PageId, updated_at_ms: i64) -> Result<bool, PortError> {
+        let err = |e| PortError::new("delete page", e);
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(err)?;
+        let Some(document_id) = page_document(&tx, id).map_err(err)? else {
+            return Ok(false);
+        };
+        tx.execute("DELETE FROM pages WHERE id = ?1", params![id.to_string()])
+            .map_err(err)?;
+        let order = page_order(&tx, &document_id).map_err(err)?;
+        renumber(&tx, &document_id, &order).map_err(err)?;
+        touch_document(&tx, &document_id, updated_at_ms).map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(true)
+    }
+
+    fn move_page(
+        &self,
+        id: PageId,
+        to_position: u32,
+        updated_at_ms: i64,
+    ) -> Result<Vec<Page>, PortError> {
+        let err = |e| PortError::new("move page", e);
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(err)?;
+        let document_id = page_document(&tx, id)
+            .map_err(err)?
+            .ok_or_else(|| PortError::new("move page", format!("page not found: {id}")))?;
+
+        let mut order = page_order(&tx, &document_id).map_err(err)?;
+        let page = id.to_string();
+        if let Some(from) = order.iter().position(|p| *p == page) {
+            let moved = order.remove(from);
+            let to = (to_position as usize).min(order.len());
+            order.insert(to, moved);
+        }
+        renumber(&tx, &document_id, &order).map_err(err)?;
+        touch_document(&tx, &document_id, updated_at_ms).map_err(err)?;
+
+        let pages = {
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT {PAGE_COLUMNS} FROM pages WHERE document_id = ?1 ORDER BY position"
+                ))
+                .map_err(err)?;
+            stmt.query_map(params![document_id], page_from_row)
+                .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+                .map_err(err)?
+        };
+        tx.commit().map_err(err)?;
+        Ok(pages)
     }
 
     fn set_page_crop(
@@ -385,6 +526,93 @@ mod tests {
         assert_eq!(repo.get_page(page.id).unwrap(), Some(updated.clone()));
         assert_eq!(repo.list_pages(d.id).unwrap(), vec![updated]);
         assert_eq!(repo.get_document(d.id).unwrap().unwrap().updated_at_ms, 50);
+    }
+
+    fn ids(pages: &[Page]) -> Vec<PageId> {
+        pages.iter().map(|p| p.id).collect()
+    }
+
+    #[test]
+    fn rename_and_delete_documents() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("draft", 1);
+        repo.insert_document(&d).unwrap();
+        repo.append_page(&new_page(d.id, 2)).unwrap();
+
+        let renamed = repo.rename_document(d.id, "final", 5).unwrap().unwrap();
+        assert_eq!(
+            (renamed.title.as_str(), renamed.updated_at_ms),
+            ("final", 5)
+        );
+        assert_eq!(
+            repo.rename_document(DocumentId::new(), "x", 5).unwrap(),
+            None
+        );
+
+        assert!(repo.delete_document(d.id).unwrap());
+        assert_eq!(repo.get_document(d.id).unwrap(), None);
+        assert!(
+            repo.list_pages(d.id).unwrap().is_empty(),
+            "pages must cascade"
+        );
+        assert!(!repo.delete_document(d.id).unwrap());
+    }
+
+    #[test]
+    fn deleting_pages_keeps_positions_contiguous() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let p: Vec<_> = (0..5)
+            .map(|i| repo.append_page(&new_page(d.id, i)).unwrap())
+            .collect();
+
+        assert!(repo.delete_page(p[0].id, 10).unwrap());
+        assert!(repo.delete_page(p[2].id, 11).unwrap());
+        assert!(!repo.delete_page(p[2].id, 12).unwrap());
+
+        let pages = repo.list_pages(d.id).unwrap();
+        assert_eq!(ids(&pages), vec![p[1].id, p[3].id, p[4].id]);
+        assert_eq!(
+            pages.iter().map(|p| p.position).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(repo.get_document(d.id).unwrap().unwrap().page_count, 3);
+        // Appending after deletions still finds a free slot.
+        let appended = repo.append_page(&new_page(d.id, 20)).unwrap();
+        assert_eq!(appended.position, 3);
+    }
+
+    #[test]
+    fn moving_pages_in_both_directions() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let p: Vec<_> = (0..4)
+            .map(|i| repo.append_page(&new_page(d.id, i)).unwrap().id)
+            .collect();
+
+        // Last to first, first to last, middle forward, out-of-range clamps.
+        assert_eq!(
+            ids(&repo.move_page(p[3], 0, 5).unwrap()),
+            vec![p[3], p[0], p[1], p[2]]
+        );
+        assert_eq!(
+            ids(&repo.move_page(p[3], 3, 6).unwrap()),
+            vec![p[0], p[1], p[2], p[3]]
+        );
+        assert_eq!(
+            ids(&repo.move_page(p[1], 2, 7).unwrap()),
+            vec![p[0], p[2], p[1], p[3]]
+        );
+        let order = repo.move_page(p[0], 99, 8).unwrap();
+        assert_eq!(ids(&order), vec![p[2], p[1], p[3], p[0]]);
+        assert_eq!(
+            order.iter().map(|p| p.position).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(repo.get_document(d.id).unwrap().unwrap().updated_at_ms, 8);
+        assert!(repo.move_page(PageId::new(), 0, 9).is_err());
     }
 
     #[test]

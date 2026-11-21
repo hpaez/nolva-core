@@ -74,6 +74,15 @@ impl PageFileStore for LocalPageFileStore {
         }
     }
 
+    fn remove_document_files(&self, document_id: DocumentId) -> Result<(), PortError> {
+        let dir = self.root.join("documents").join(document_id.to_string());
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PortError::new("remove document files", e)),
+        }
+    }
+
     fn remove_page_files(&self, document_id: DocumentId, page_id: PageId) -> Result<(), PortError> {
         let dir = self
             .root
@@ -117,6 +126,14 @@ mod tests {
         assert!(!store.resolve(&rel).exists());
         // Idempotent.
         store.remove_page_files(d, p).unwrap();
+
+        let rel = store
+            .import_original(d, PageId::new(), ImageFormat::Jpeg, &src)
+            .unwrap();
+        store.remove_document_files(d).unwrap();
+        assert!(!store.resolve(&rel).exists());
+        assert!(!root.path().join("documents").join(d.to_string()).exists());
+        store.remove_document_files(d).unwrap();
     }
 
     #[test]
