@@ -2,10 +2,8 @@ name: CI
 
 on:
   pull_request:
-    paths-ignore: ["**.md", "docs/**"]
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**"]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,8 +16,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # paths-filter lists a PR's changed files through the API.
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # A file counts as code unless it matches every exclusion below.
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+
   rust:
     name: fmt · clippy · test · bindings
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -42,6 +65,8 @@ jobs:
 
   android:
     name: android native build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # macOS minutes are expensive on private repos; iOS is built on release only.
@@ -72,3 +97,22 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
       - name: Compile Android library
         run: gradle -p android :nolva-core:assembleRelease
+
+  # The only check required by branch protection. It always runs and fails
+  # if any job failed or was cancelled; skipped jobs (docs-only changes)
+  # count as success. Required checks then never get stuck waiting for jobs
+  # that were skipped, and renaming jobs doesn't touch protection settings.
+  result:
+    name: CI result
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, rust, android]
+    if: always()
+    steps:
+      - name: Check job results
+        run: |
+          echo '${{ toJSON(needs) }}'
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::A required job failed or was cancelled."
+            exit 1
+          fi

@@ -17,3 +17,6 @@ xcuserdata/
 .DS_Store
 .idea/
 *.iml
+
+# Local Claude Code settings
+.claude/
