@@ -8,6 +8,8 @@ through [UniFFI](https://mozilla.github.io/uniffi-rs/).
 ```text
 crates/
   document-engine/   Domain model and use cases (no I/O; defines ports)
+  scanner-engine/    Document detection: finds the page corners in a photo
+  image-engine/      Oriented decoding, perspective correction, JPEG encoding
   storage-engine/    SQLite (metadata) + file system (images)
   core-ffi/          Public UniFFI API (lib: nolva_core)
 tools/uniffi-bindgen Bindings generator pinned to the uniffi version
@@ -17,26 +19,37 @@ scripts/             iOS/Android builds and bindings generation
 docs/decisions/      ADRs
 ```
 
-Crate dependencies: `core-ffi → storage-engine → document-engine`.
-The domain knows nothing about SQLite or the mobile platforms.
+Crate dependencies: `core-ffi → {storage-engine, image-engine → scanner-engine} → document-engine`.
+The domain knows nothing about SQLite, image processing or the mobile
+platforms; those are plugged in through ports.
 
-## Current API (v0.1)
+## Current API (v0.2)
 
 ```swift
 let core = try NolvaCore(config: CoreConfig(dataDir: appSupportPath))
 let doc  = try core.createDocument(title: "Contract")
 let page = try core.addPage(documentId: doc.id, imagePath: capturedFile.path)
-let docs = try core.listDocuments()
+
+// Find the sheet and straighten it. The original is kept untouched.
+let corners = try core.detectPageCorners(pageId: page.id)?.corners ?? fullImage
+let cropped = try core.cropPage(pageId: page.id, corners: corners)
+show(cropped.processedPath ?? cropped.originalPath)
 ```
 
 ```kotlin
 val core = NolvaCore(CoreConfig(dataDir = context.filesDir.absolutePath))
 val doc = core.createDocument("Contract")
 val page = core.addPage(doc.id, capturedFile.absolutePath)
+val detection = core.detectPageCorners(page.id)   // null if no sheet found
+val cropped = core.cropPage(page.id, detection?.corners ?: fullImage)
 ```
 
-Calls are synchronous and may block on I/O: invoke them off the main thread
-(`Dispatchers.IO` or a background `Task`).
+Corners are normalized (`0.0..=1.0`) in the coordinates of the original
+image as displayed, i.e. with EXIF orientation applied.
+
+Calls are synchronous and may block on I/O or CPU (detection and cropping
+take up to ~1 s on a 12 MP photo): invoke them off the main thread
+(`Dispatchers.IO` / `Dispatchers.Default` or a background `Task`).
 
 ## Development
 

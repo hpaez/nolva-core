@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::model::DocumentId;
+use crate::model::{DocumentId, PageId};
 
 /// Failure reported by a port implementation (database, file system, ...).
 ///
@@ -25,6 +25,19 @@ impl PortError {
     }
 }
 
+/// Failure reported by a [`crate::PageProcessor`].
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessingError {
+    #[error("unsupported image format")]
+    UnsupportedFormat,
+
+    #[error("invalid corners: {0}")]
+    InvalidCorners(String),
+
+    #[error(transparent)]
+    Failed(#[from] PortError),
+}
+
 /// Errors produced by document use cases.
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentError {
@@ -36,6 +49,12 @@ pub enum DocumentError {
 
     #[error("document not found: {0}")]
     DocumentNotFound(DocumentId),
+
+    #[error("page not found: {0}")]
+    PageNotFound(PageId),
+
+    #[error("invalid corners: {reason}")]
+    InvalidCorners { reason: String },
 
     #[error("source image not found: {}", .0.display())]
     SourceImageNotFound(PathBuf),

@@ -25,7 +25,17 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX documents_updated_at_idx ON documents(updated_at_ms DESC);
     "#,
+    // 2: non-destructive crops. `crop` holds 8 comma-separated normalized
+    // coordinates (TL, TR, BR, BL as x,y pairs); both NULL until cropped.
+    r#"
+    ALTER TABLE pages ADD COLUMN crop TEXT;
+    ALTER TABLE pages ADD COLUMN processed_path TEXT;
+    "#,
 ];
+
+/// Schema 1 as shipped in v0.1, for migration tests.
+#[cfg(test)]
+pub(crate) const V1_FOR_TESTS: &str = MIGRATIONS[0];
 
 /// Latest schema version known to this build.
 pub(crate) fn latest_version() -> i64 {

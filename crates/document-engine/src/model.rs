@@ -62,8 +62,37 @@ pub struct Document {
     pub page_count: u32,
 }
 
+/// Page outline chosen for cropping: four corners in normalized coordinates
+/// (`0.0..=1.0`) of the oriented original, clockwise from the top left.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crop {
+    corners: [(f32, f32); 4],
+}
+
+impl Crop {
+    /// Validates that every coordinate is a finite number inside the image.
+    /// Shape checks (convexity, size) belong to the image processor.
+    pub fn new(corners: [(f32, f32); 4]) -> Result<Self, DocumentError> {
+        let valid = corners.iter().all(|&(x, y)| {
+            x.is_finite() && y.is_finite() && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)
+        });
+        if valid {
+            Ok(Self { corners })
+        } else {
+            Err(DocumentError::InvalidCorners {
+                reason: "coordinates must be within 0.0..=1.0".into(),
+            })
+        }
+    }
+
+    /// Top-left, top-right, bottom-right, bottom-left.
+    pub fn corners(&self) -> [(f32, f32); 4] {
+        self.corners
+    }
+}
+
 /// A single page of a document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Page {
     pub id: PageId,
     pub document_id: DocumentId,
@@ -74,6 +103,11 @@ pub struct Page {
     /// Relative on purpose: the absolute app container path changes between
     /// installs and OS updates (notably on iOS).
     pub original_path: PathBuf,
+    /// Outline used for the processed image, if the page was cropped.
+    pub crop: Option<Crop>,
+    /// Perspective-corrected image, relative to the storage root. `None`
+    /// until the page is cropped; the original is never modified.
+    pub processed_path: Option<PathBuf>,
     pub created_at_ms: i64,
 }
 
