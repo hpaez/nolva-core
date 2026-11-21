@@ -1,7 +1,13 @@
 # Publishes a versioned release of the core:
-#   - iOS:     NolvaCoreFFI.xcframework.zip as a GitHub Release asset, with
-#              Package.swift + Swift bindings committed and tagged vX.Y.Z.
+#   - iOS:     NolvaCoreFFI.xcframework.zip as a GitHub Release asset, plus a
+#              release commit (Package.swift pointing at it + Swift bindings)
+#              reachable only from tag vX.Y.Z.
 #   - Android: app.nolva:nolva-core:X.Y.Z (.aar) to GitHub Packages.
+#
+# The release commit is NOT pushed to main: main is protected (PRs, signed
+# commits, required checks) and doesn't need it. SwiftPM resolves packages by
+# tag, so apps pinned to vX.Y.Z get the binary; main keeps an empty binary URL,
+# which Package.swift treats as "use a local build".
 #
 # Run it manually from the Actions tab after bumping the version in the root
 # Cargo.toml ([workspace.package] version) on main.
@@ -78,7 +84,7 @@ jobs:
           # repos with a ~/.netrc entry for api.github.com.
           echo "url=https://api.github.com/repos/${{ github.repository }}/releases/assets/${asset_id}.zip" >> "$GITHUB_OUTPUT"
 
-      - name: Commit Package.swift + Swift bindings and tag
+      - name: Create the release commit and tag (tag only, not main)
         run: |
           bash scripts/update-package-swift.sh "${{ steps.upload.outputs.url }}" \
             "$(cat build/apple/NolvaCoreFFI.xcframework.zip.checksum)"
@@ -87,7 +93,7 @@ jobs:
           git add Package.swift apple/Sources/NolvaCore/NolvaCore.swift
           git commit -m "release: $TAG"
           git tag -a "$TAG" -m "Nolva core $VERSION"
-          git push origin HEAD:main "$TAG"
+          git push origin "refs/tags/$TAG"
 
       - name: Publish release
         env:
@@ -104,7 +110,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
+          ref: refs/tags/${{ env.TAG }}
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:

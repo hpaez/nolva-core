@@ -28,6 +28,11 @@ Use versioned artifacts (option 3):
 - **Android:** `app.nolva:nolva-core:X.Y.Z` (.aar with the `.so` files and the
   Kotlin bindings) published to GitHub Packages.
 - A single workflow (`release.yml`) produces both artifacts for the same version.
+- The release commit that points `Package.swift` at the XCFramework exists only
+  on the `vX.Y.Z` tag, never on `main`. `main` is protected (pull requests,
+  signed commits, required checks) and SwiftPM resolves versions by tag, so
+  `main` doesn't need it. (Added after the first protected-branch release
+  was rejected.)
 
 ## Consequences
 
