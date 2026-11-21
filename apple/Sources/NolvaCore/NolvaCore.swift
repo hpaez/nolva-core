@@ -497,6 +497,22 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -555,6 +571,22 @@ public protocol NolvaCoreProtocol: AnyObject, Sendable {
     func addPage(documentId: String, imagePath: String) throws  -> PageInfo
     
     func createDocument(title: String) throws  -> DocumentInfo
+    
+    /**
+     * Crops and straightens the page to `corners`, storing the result as
+     * the page's processed image. Can be called again to re-crop; the
+     * original is never modified. CPU-heavy: call off the main thread.
+     */
+    func cropPage(pageId: String, corners: PageCorners) throws  -> PageInfo
+    
+    /**
+     * Finds the page outline in the page's original photo. Returns `None`
+     * when nothing document-like is found (start the editor at the full
+     * image). CPU-heavy: call off the main thread.
+     */
+    func detectPageCorners(pageId: String) throws  -> CornerDetection?
+    
+    func getPage(pageId: String) throws  -> PageInfo
     
     func listDocuments() throws  -> [DocumentInfo]
     
@@ -647,6 +679,47 @@ open func createDocument(title: String)throws  -> DocumentInfo  {
     uniffi_nolva_core_fn_method_nolvacore_create_document(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(title),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Crops and straightens the page to `corners`, storing the result as
+     * the page's processed image. Can be called again to re-crop; the
+     * original is never modified. CPU-heavy: call off the main thread.
+     */
+open func cropPage(pageId: String, corners: PageCorners)throws  -> PageInfo  {
+    return try  FfiConverterTypePageInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_crop_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),
+        FfiConverterTypePageCorners_lower(corners),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Finds the page outline in the page's original photo. Returns `None`
+     * when nothing document-like is found (start the editor at the full
+     * image). CPU-heavy: call off the main thread.
+     */
+open func detectPageCorners(pageId: String)throws  -> CornerDetection?  {
+    return try  FfiConverterOptionTypeCornerDetection.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_detect_page_corners(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),uniffiCallStatus
+    )
+})
+}
+    
+open func getPage(pageId: String)throws  -> PageInfo  {
+    return try  FfiConverterTypePageInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_get_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),uniffiCallStatus
     )
 })
 }
@@ -781,6 +854,69 @@ public func FfiConverterTypeCoreConfig_lower(_ value: CoreConfig) -> RustBuffer 
 }
 
 
+/**
+ * An automatically detected page outline.
+ */
+public struct CornerDetection: Equatable, Hashable {
+    public var corners: PageCorners
+    /**
+     * `0.0..=1.0`. Below ~0.6, ask the user to check the corners.
+     */
+    public var confidence: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(corners: PageCorners, 
+        /**
+         * `0.0..=1.0`. Below ~0.6, ask the user to check the corners.
+         */confidence: Float) {
+        self.corners = corners
+        self.confidence = confidence
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CornerDetection: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCornerDetection: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CornerDetection {
+        return
+            try CornerDetection(
+                corners: FfiConverterTypePageCorners.read(from: &buf), 
+                confidence: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CornerDetection, into buf: inout [UInt8]) {
+        FfiConverterTypePageCorners.write(value.corners, into: &buf)
+        FfiConverterFloat.write(value.confidence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCornerDetection_lift(_ buf: RustBuffer) throws -> CornerDetection {
+    return try FfiConverterTypeCornerDetection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCornerDetection_lower(_ value: CornerDetection) -> RustBuffer {
+    return FfiConverterTypeCornerDetection.lower(value)
+}
+
+
 public struct DocumentInfo: Equatable, Hashable {
     public var id: String
     public var title: String
@@ -847,14 +983,148 @@ public func FfiConverterTypeDocumentInfo_lower(_ value: DocumentInfo) -> RustBuf
 }
 
 
+/**
+ * A point in normalized image coordinates (`0.0..=1.0`, origin top left)
+ * of the original image as displayed (EXIF orientation applied).
+ */
+public struct NormalizedPoint: Equatable, Hashable {
+    public var x: Float
+    public var y: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(x: Float, y: Float) {
+        self.x = x
+        self.y = y
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NormalizedPoint: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNormalizedPoint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NormalizedPoint {
+        return
+            try NormalizedPoint(
+                x: FfiConverterFloat.read(from: &buf), 
+                y: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NormalizedPoint, into buf: inout [UInt8]) {
+        FfiConverterFloat.write(value.x, into: &buf)
+        FfiConverterFloat.write(value.y, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNormalizedPoint_lift(_ buf: RustBuffer) throws -> NormalizedPoint {
+    return try FfiConverterTypeNormalizedPoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNormalizedPoint_lower(_ value: NormalizedPoint) -> RustBuffer {
+    return FfiConverterTypeNormalizedPoint.lower(value)
+}
+
+
+/**
+ * The four corners of a page outline.
+ */
+public struct PageCorners: Equatable, Hashable {
+    public var topLeft: NormalizedPoint
+    public var topRight: NormalizedPoint
+    public var bottomRight: NormalizedPoint
+    public var bottomLeft: NormalizedPoint
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(topLeft: NormalizedPoint, topRight: NormalizedPoint, bottomRight: NormalizedPoint, bottomLeft: NormalizedPoint) {
+        self.topLeft = topLeft
+        self.topRight = topRight
+        self.bottomRight = bottomRight
+        self.bottomLeft = bottomLeft
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PageCorners: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePageCorners: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PageCorners {
+        return
+            try PageCorners(
+                topLeft: FfiConverterTypeNormalizedPoint.read(from: &buf), 
+                topRight: FfiConverterTypeNormalizedPoint.read(from: &buf), 
+                bottomRight: FfiConverterTypeNormalizedPoint.read(from: &buf), 
+                bottomLeft: FfiConverterTypeNormalizedPoint.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PageCorners, into buf: inout [UInt8]) {
+        FfiConverterTypeNormalizedPoint.write(value.topLeft, into: &buf)
+        FfiConverterTypeNormalizedPoint.write(value.topRight, into: &buf)
+        FfiConverterTypeNormalizedPoint.write(value.bottomRight, into: &buf)
+        FfiConverterTypeNormalizedPoint.write(value.bottomLeft, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageCorners_lift(_ buf: RustBuffer) throws -> PageCorners {
+    return try FfiConverterTypePageCorners.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageCorners_lower(_ value: PageCorners) -> RustBuffer {
+    return FfiConverterTypePageCorners.lower(value)
+}
+
+
 public struct PageInfo: Equatable, Hashable {
     public var id: String
     public var documentId: String
     public var position: UInt32
     /**
      * Absolute path of the original image, resolved for the current install.
+     * Never modified.
      */
     public var originalPath: String
+    /**
+     * Absolute path of the cropped, perspective-corrected image, if the
+     * page has been cropped. Show this when present, else the original.
+     */
+    public var processedPath: String?
+    /**
+     * Corners used for `processed_path`, to reopen the crop editor where
+     * the user left it.
+     */
+    public var corners: PageCorners?
     public var createdAtMs: Int64
 
     // Default memberwise initializers are never public by default, so we
@@ -862,11 +1132,22 @@ public struct PageInfo: Equatable, Hashable {
     public init(id: String, documentId: String, position: UInt32, 
         /**
          * Absolute path of the original image, resolved for the current install.
-         */originalPath: String, createdAtMs: Int64) {
+         * Never modified.
+         */originalPath: String, 
+        /**
+         * Absolute path of the cropped, perspective-corrected image, if the
+         * page has been cropped. Show this when present, else the original.
+         */processedPath: String?, 
+        /**
+         * Corners used for `processed_path`, to reopen the crop editor where
+         * the user left it.
+         */corners: PageCorners?, createdAtMs: Int64) {
         self.id = id
         self.documentId = documentId
         self.position = position
         self.originalPath = originalPath
+        self.processedPath = processedPath
+        self.corners = corners
         self.createdAtMs = createdAtMs
     }
 
@@ -890,6 +1171,8 @@ public struct FfiConverterTypePageInfo: FfiConverterRustBuffer {
                 documentId: FfiConverterString.read(from: &buf), 
                 position: FfiConverterUInt32.read(from: &buf), 
                 originalPath: FfiConverterString.read(from: &buf), 
+                processedPath: FfiConverterOptionString.read(from: &buf), 
+                corners: FfiConverterOptionTypePageCorners.read(from: &buf), 
                 createdAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -899,6 +1182,8 @@ public struct FfiConverterTypePageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.documentId, into: &buf)
         FfiConverterUInt32.write(value.position, into: &buf)
         FfiConverterString.write(value.originalPath, into: &buf)
+        FfiConverterOptionString.write(value.processedPath, into: &buf)
+        FfiConverterOptionTypePageCorners.write(value.corners, into: &buf)
         FfiConverterInt64.write(value.createdAtMs, into: &buf)
     }
 }
@@ -1033,6 +1318,78 @@ public func FfiConverterTypeNolvaError_lower(_ value: NolvaError) -> RustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCornerDetection: FfiConverterRustBuffer {
+    typealias SwiftType = CornerDetection?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCornerDetection.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCornerDetection.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePageCorners: FfiConverterRustBuffer {
+    typealias SwiftType = PageCorners?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePageCorners.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePageCorners.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeDocumentInfo: FfiConverterRustBuffer {
     typealias SwiftType = [DocumentInfo]
 
@@ -1112,6 +1469,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nolva_core_checksum_method_nolvacore_create_document() != 10378) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_crop_page() != 44767) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_detect_page_corners() != 63951) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_get_page() != 38191) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nolva_core_checksum_method_nolvacore_list_documents() != 42470) {
