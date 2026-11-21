@@ -22,6 +22,32 @@ pub trait DocumentRepository: Send + Sync {
 
     fn get_page(&self, id: PageId) -> Result<Option<Page>, PortError>;
 
+    /// Renames a document and bumps its `updated_at_ms`. Returns the updated
+    /// document, or `None` if it doesn't exist.
+    fn rename_document(
+        &self,
+        id: DocumentId,
+        title: &str,
+        updated_at_ms: i64,
+    ) -> Result<Option<Document>, PortError>;
+
+    /// Deletes a document and all its pages. Returns whether it existed.
+    fn delete_document(&self, id: DocumentId) -> Result<bool, PortError>;
+
+    /// Deletes a page, closes the gap in its document's positions and bumps
+    /// the document's `updated_at_ms`, atomically. Returns whether it existed.
+    fn delete_page(&self, id: PageId, updated_at_ms: i64) -> Result<bool, PortError>;
+
+    /// Moves a page to `to_position` (clamped to the document), shifting the
+    /// pages in between, and bumps the document's `updated_at_ms`, atomically.
+    /// Returns the document's pages in their new order.
+    fn move_page(
+        &self,
+        id: PageId,
+        to_position: u32,
+        updated_at_ms: i64,
+    ) -> Result<Vec<Page>, PortError>;
+
     /// Records a page's crop and processed image, and bumps its document's
     /// `updated_at_ms`, atomically. Returns the updated page.
     fn set_page_crop(
@@ -52,6 +78,9 @@ pub trait PageFileStore: Send + Sync {
 
     /// Removes a single stored file. Missing files are not an error.
     fn remove_file(&self, relative: &Path) -> Result<(), PortError>;
+
+    /// Removes every file belonging to a document. Missing files are not an error.
+    fn remove_document_files(&self, document_id: DocumentId) -> Result<(), PortError>;
 
     /// Removes every file belonging to a page. Missing files are not an error.
     fn remove_page_files(&self, document_id: DocumentId, page_id: PageId) -> Result<(), PortError>;
