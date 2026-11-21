@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/document-engine",
+    "crates/image-engine",
     "crates/scanner-engine",
     "crates/storage-engine",
     "crates/core-ffi",
@@ -18,6 +19,7 @@ publish = false
 
 [workspace.dependencies]
 document-engine = { path = "crates/document-engine" }
+scanner-engine = { path = "crates/scanner-engine" }
 storage-engine = { path = "crates/storage-engine" }
 
 # Image crates: codecs are opted into per crate; core types need none.
