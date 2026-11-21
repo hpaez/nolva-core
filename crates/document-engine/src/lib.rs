@@ -13,7 +13,7 @@ mod service;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{DocumentError, PortError, ProcessingError};
-pub use model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageId};
+pub use model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
 pub use ports::{
     CornerDetection, DocumentExporter, DocumentRepository, ExportSummary, PageFileStore,
     PageProcessor, PaperSize, PdfExportOptions,

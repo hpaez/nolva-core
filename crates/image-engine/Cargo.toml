@@ -1,6 +1,6 @@
 [package]
 name = "image-engine"
-description = "Image I/O and processing for Nolva: oriented decoding, perspective correction, encoding."
+description = "Image I/O and processing for Nolva: oriented decoding, perspective correction, filters, encoding."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

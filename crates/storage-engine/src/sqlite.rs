@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use document_engine::{
-    Crop, Document, DocumentId, DocumentRepository, NewPage, Page, PageId, PortError,
+    Crop, Document, DocumentId, DocumentRepository, NewPage, Page, PageFilter, PageId, PortError,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -74,12 +74,13 @@ fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
 }
 
 const PAGE_COLUMNS: &str =
-    "id, document_id, position, original_path, created_at_ms, crop, processed_path";
+    "id, document_id, position, original_path, created_at_ms, crop, processed_path, filter";
 
 fn page_from_row(row: &Row<'_>) -> rusqlite::Result<Page> {
     let original: String = row.get(3)?;
     let crop: Option<String> = row.get(5)?;
     let processed: Option<String> = row.get(6)?;
+    let filter: String = row.get(7)?;
     Ok(Page {
         id: parse_id::<PageId>(row, 0)?,
         document_id: parse_id(row, 1)?,
@@ -87,6 +88,9 @@ fn page_from_row(row: &Row<'_>) -> rusqlite::Result<Page> {
         original_path: PathBuf::from(original),
         crop: crop.map(|c| crop_from_db(&c)).transpose().map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
+        })?,
+        filter: filter_from_db(&filter).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, e.into())
         })?,
         processed_path: processed.map(PathBuf::from),
         created_at_ms: row.get(4)?,
@@ -152,6 +156,25 @@ fn crop_to_db(crop: &Crop) -> String {
         .map(|v| v.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn filter_to_db(filter: PageFilter) -> &'static str {
+    match filter {
+        PageFilter::Original => "original",
+        PageFilter::Grayscale => "grayscale",
+        PageFilter::BlackAndWhite => "black_and_white",
+        PageFilter::Enhanced => "enhanced",
+    }
+}
+
+fn filter_from_db(value: &str) -> Result<PageFilter, String> {
+    match value {
+        "original" => Ok(PageFilter::Original),
+        "grayscale" => Ok(PageFilter::Grayscale),
+        "black_and_white" => Ok(PageFilter::BlackAndWhite),
+        "enhanced" => Ok(PageFilter::Enhanced),
+        other => Err(format!("unknown page filter: {other}")),
+    }
 }
 
 fn crop_from_db(value: &str) -> Result<Crop, String> {
@@ -261,6 +284,7 @@ impl DocumentRepository for SqliteDocumentRepository {
             position,
             original_path: p.original_path.clone(),
             crop: None,
+            filter: PageFilter::Original,
             processed_path: None,
             created_at_ms: p.created_at_ms,
         })
@@ -377,28 +401,34 @@ impl DocumentRepository for SqliteDocumentRepository {
         Ok(pages)
     }
 
-    fn set_page_crop(
+    fn set_page_rendering(
         &self,
         id: PageId,
-        crop: &Crop,
-        processed_path: &Path,
+        crop: Option<&Crop>,
+        filter: PageFilter,
+        processed_path: Option<&Path>,
         updated_at_ms: i64,
     ) -> Result<Page, PortError> {
-        let processed = path_to_db(processed_path)?;
+        let processed = processed_path.map(path_to_db).transpose()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| PortError::new("set page crop", e))?;
+            .map_err(|e| PortError::new("set page rendering", e))?;
 
         let changed = tx
             .execute(
-                "UPDATE pages SET crop = ?2, processed_path = ?3 WHERE id = ?1",
-                params![id.to_string(), crop_to_db(crop), processed],
+                "UPDATE pages SET crop = ?2, processed_path = ?3, filter = ?4 WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    crop.map(crop_to_db),
+                    processed,
+                    filter_to_db(filter)
+                ],
             )
-            .map_err(|e| PortError::new("set page crop", e))?;
+            .map_err(|e| PortError::new("set page rendering", e))?;
         if changed != 1 {
             return Err(PortError::new(
-                "set page crop",
+                "set page rendering",
                 format!("page not found: {id}"),
             ));
         }
@@ -407,7 +437,7 @@ impl DocumentRepository for SqliteDocumentRepository {
              WHERE id = (SELECT document_id FROM pages WHERE id = ?1)",
             params![id.to_string(), updated_at_ms],
         )
-        .map_err(|e| PortError::new("set page crop", e))?;
+        .map_err(|e| PortError::new("set page rendering", e))?;
 
         let page = tx
             .query_row(
@@ -415,9 +445,9 @@ impl DocumentRepository for SqliteDocumentRepository {
                 params![id.to_string()],
                 page_from_row,
             )
-            .map_err(|e| PortError::new("set page crop", e))?;
+            .map_err(|e| PortError::new("set page rendering", e))?;
         tx.commit()
-            .map_err(|e| PortError::new("set page crop", e))?;
+            .map_err(|e| PortError::new("set page rendering", e))?;
         Ok(page)
     }
 }
@@ -515,10 +545,17 @@ mod tests {
             Crop::new([(0.1, 1.0 / 3.0), (0.9, 0.12345678), (0.87, 0.9), (0.0, 1.0)]).unwrap();
 
         let updated = repo
-            .set_page_crop(page.id, &crop, Path::new("documents/x/processed-1.jpg"), 50)
+            .set_page_rendering(
+                page.id,
+                Some(&crop),
+                PageFilter::Enhanced,
+                Some(Path::new("documents/x/processed-1.jpg")),
+                50,
+            )
             .unwrap();
 
         assert_eq!(updated.crop, Some(crop));
+        assert_eq!(updated.filter, PageFilter::Enhanced);
         assert_eq!(
             updated.processed_path,
             Some(PathBuf::from("documents/x/processed-1.jpg"))
@@ -526,6 +563,34 @@ mod tests {
         assert_eq!(repo.get_page(page.id).unwrap(), Some(updated.clone()));
         assert_eq!(repo.list_pages(d.id).unwrap(), vec![updated]);
         assert_eq!(repo.get_document(d.id).unwrap().unwrap().updated_at_ms, 50);
+
+        // Back to the untouched original.
+        let reset = repo
+            .set_page_rendering(page.id, None, PageFilter::Original, None, 60)
+            .unwrap();
+        assert_eq!(
+            (reset.crop, reset.filter, reset.processed_path),
+            (None, PageFilter::Original, None)
+        );
+    }
+
+    #[test]
+    fn every_filter_round_trips() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let page = repo.append_page(&new_page(d.id, 2)).unwrap();
+        assert_eq!(page.filter, PageFilter::Original);
+        for filter in [
+            PageFilter::Grayscale,
+            PageFilter::BlackAndWhite,
+            PageFilter::Enhanced,
+            PageFilter::Original,
+        ] {
+            repo.set_page_rendering(page.id, None, filter, Some(Path::new("p.jpg")), 3)
+                .unwrap();
+            assert_eq!(repo.get_page(page.id).unwrap().unwrap().filter, filter);
+        }
     }
 
     fn ids(pages: &[Page]) -> Vec<PageId> {
@@ -620,8 +685,14 @@ mod tests {
         let repo = SqliteDocumentRepository::open_in_memory().unwrap();
         let crop = Crop::new([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]).unwrap();
         assert!(
-            repo.set_page_crop(PageId::new(), &crop, Path::new("x.jpg"), 1)
-                .is_err()
+            repo.set_page_rendering(
+                PageId::new(),
+                Some(&crop),
+                PageFilter::Original,
+                Some(Path::new("x.jpg")),
+                1
+            )
+            .is_err()
         );
         assert_eq!(repo.get_page(PageId::new()).unwrap(), None);
     }
@@ -657,6 +728,7 @@ mod tests {
             PathBuf::from("documents/a/original.jpg")
         );
         assert_eq!((page.crop, page.processed_path), (None, None));
+        assert_eq!(page.filter, PageFilter::Original);
     }
 
     #[test]

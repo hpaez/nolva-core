@@ -31,6 +31,11 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE pages ADD COLUMN crop TEXT;
     ALTER TABLE pages ADD COLUMN processed_path TEXT;
     "#,
+    // 3: page filters. Existing pages keep their look.
+    r#"
+    ALTER TABLE pages ADD COLUMN filter TEXT NOT NULL DEFAULT 'original'
+        CHECK (filter IN ('original', 'grayscale', 'black_and_white', 'enhanced'));
+    "#,
 ];
 
 /// Schema 1 as shipped in v0.1, for migration tests.

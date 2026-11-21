@@ -6,10 +6,12 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use document_engine::{
-    CornerDetection, Crop, DocumentExporter, ExportSummary, PageProcessor, PaperSize,
+    CornerDetection, Crop, DocumentExporter, ExportSummary, PageFilter, PageProcessor, PaperSize,
     PdfExportOptions, PortError, ProcessingError,
 };
-use image_engine::{ImageError, correct_perspective, load_oriented, save_jpeg};
+use image_engine::{
+    Filter, ImageError, apply_filter, correct_perspective, load_oriented, save_jpeg,
+};
 use pdf_engine::{PageSize, PdfError, PdfOptions, write_pdf};
 use scanner_engine::{Point, Quad, detect_document};
 
@@ -29,14 +31,26 @@ impl PageProcessor for ImagePageProcessor {
             .transpose()
     }
 
-    fn render_crop(
+    fn render_page(
         &self,
         original: &Path,
-        crop: &Crop,
+        crop: Option<&Crop>,
+        filter: PageFilter,
         output: &Path,
     ) -> Result<(), ProcessingError> {
         let image = load_oriented(original).map_err(processing_error)?;
-        let page = correct_perspective(&image, &crop_to_quad(crop)).map_err(processing_error)?;
+        let page = match crop {
+            Some(crop) => {
+                correct_perspective(&image, &crop_to_quad(crop)).map_err(processing_error)?
+            }
+            None => image,
+        };
+        let page = match filter {
+            PageFilter::Original => page,
+            PageFilter::Grayscale => apply_filter(&page, Filter::Grayscale),
+            PageFilter::BlackAndWhite => apply_filter(&page, Filter::BlackAndWhite),
+            PageFilter::Enhanced => apply_filter(&page, Filter::Enhanced),
+        };
         save_jpeg(&page, output).map_err(processing_error)
     }
 }
