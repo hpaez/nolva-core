@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{PortError, ProcessingError};
-use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageId};
+use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
 
 /// Persistence of document and page metadata.
 pub trait DocumentRepository: Send + Sync {
@@ -48,13 +48,15 @@ pub trait DocumentRepository: Send + Sync {
         updated_at_ms: i64,
     ) -> Result<Vec<Page>, PortError>;
 
-    /// Records a page's crop and processed image, and bumps its document's
-    /// `updated_at_ms`, atomically. Returns the updated page.
-    fn set_page_crop(
+    /// Records how a page is rendered (crop, filter and the resulting
+    /// processed image, if any) and bumps its document's `updated_at_ms`,
+    /// atomically. Returns the updated page.
+    fn set_page_rendering(
         &self,
         id: PageId,
-        crop: &Crop,
-        processed_path: &Path,
+        crop: Option<&Crop>,
+        filter: PageFilter,
+        processed_path: Option<&Path>,
         updated_at_ms: i64,
     ) -> Result<Page, PortError>;
 }
@@ -102,12 +104,13 @@ pub trait PageProcessor: Send + Sync {
     /// Finds the page outline in the image at `original`, if any.
     fn detect_corners(&self, original: &Path) -> Result<Option<CornerDetection>, ProcessingError>;
 
-    /// Writes the perspective-corrected region of `original` outlined by
-    /// `crop` to `output`, atomically.
-    fn render_crop(
+    /// Writes `original`, straightened to `crop` when given and with
+    /// `filter` applied, to `output`, atomically.
+    fn render_page(
         &self,
         original: &Path,
-        crop: &Crop,
+        crop: Option<&Crop>,
+        filter: PageFilter,
         output: &Path,
     ) -> Result<(), ProcessingError>;
 }

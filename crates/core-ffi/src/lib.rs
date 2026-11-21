@@ -55,12 +55,14 @@ pub struct PageInfo {
     /// Absolute path of the original image, resolved for the current install.
     /// Never modified.
     pub original_path: String,
-    /// Absolute path of the cropped, perspective-corrected image, if the
-    /// page has been cropped. Show this when present, else the original.
+    /// Absolute path of the cropped and/or filtered image, if the page has
+    /// a crop or a filter. Show this when present, else the original.
     pub processed_path: Option<String>,
     /// Corners used for `processed_path`, to reopen the crop editor where
     /// the user left it.
     pub corners: Option<PageCorners>,
+    /// Filter applied on top of the crop.
+    pub filter: PageFilter,
     pub created_at_ms: i64,
 }
 
@@ -87,6 +89,41 @@ pub struct CornerDetection {
     pub corners: PageCorners,
     /// `0.0..=1.0`. Below ~0.6, ask the user to check the corners.
     pub confidence: f32,
+}
+
+/// Look applied to a page on top of its crop. Always rendered from the
+/// original, so switching filters never degrades the image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PageFilter {
+    /// Colors as photographed.
+    Original,
+    Grayscale,
+    /// Pure black ink on white paper: smallest files, best for text.
+    BlackAndWhite,
+    /// Evens out lighting and shadows, whitens the paper, keeps colors.
+    Enhanced,
+}
+
+impl From<PageFilter> for document_engine::PageFilter {
+    fn from(filter: PageFilter) -> Self {
+        match filter {
+            PageFilter::Original => Self::Original,
+            PageFilter::Grayscale => Self::Grayscale,
+            PageFilter::BlackAndWhite => Self::BlackAndWhite,
+            PageFilter::Enhanced => Self::Enhanced,
+        }
+    }
+}
+
+impl From<document_engine::PageFilter> for PageFilter {
+    fn from(filter: document_engine::PageFilter) -> Self {
+        match filter {
+            document_engine::PageFilter::Original => Self::Original,
+            document_engine::PageFilter::Grayscale => Self::Grayscale,
+            document_engine::PageFilter::BlackAndWhite => Self::BlackAndWhite,
+            document_engine::PageFilter::Enhanced => Self::Enhanced,
+        }
+    }
 }
 
 /// Paper size for exported PDFs.
@@ -316,6 +353,18 @@ impl NolvaCore {
         let crop = Crop::try_from(corners)?;
         Ok(self.page_info(self.service.crop_page(id, crop)?))
     }
+
+    /// Applies `filter` to the page, on top of its crop if it has one.
+    /// CPU-heavy (up to about a second for a 12 MP photo): call it off the
+    /// main thread.
+    pub fn set_page_filter(
+        &self,
+        page_id: String,
+        filter: PageFilter,
+    ) -> Result<PageInfo, NolvaError> {
+        let id: PageId = page_id.parse()?;
+        Ok(self.page_info(self.service.set_page_filter(id, filter.into())?))
+    }
 }
 
 impl NolvaCore {
@@ -329,6 +378,7 @@ impl NolvaCore {
             original_path: absolute(&page.original_path),
             processed_path: page.processed_path.as_deref().map(absolute),
             corners: page.crop.map(PageCorners::from),
+            filter: page.filter.into(),
             created_at_ms: page.created_at_ms,
         }
     }
@@ -485,6 +535,77 @@ mod tests {
         drop(core);
         let reopened = super::tests::core(&data);
         assert_eq!(reopened.get_page(page.id).unwrap(), recropped);
+    }
+
+    #[test]
+    fn filters_combine_with_crops_end_to_end() {
+        let data = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Recibo".into()).unwrap();
+        let page = core
+            .add_page(
+                doc.id.clone(),
+                photo_of_tilted_sheet(src.path()).to_string_lossy().into(),
+            )
+            .unwrap();
+        assert_eq!(page.filter, PageFilter::Original);
+
+        let bw = core
+            .set_page_filter(page.id.clone(), PageFilter::BlackAndWhite)
+            .unwrap();
+        let bw_path = bw
+            .processed_path
+            .clone()
+            .expect("filter must render an image");
+        let bw_image = image::open(&bw_path).unwrap();
+        assert_eq!(
+            bw_image.color(),
+            image::ColorType::L8,
+            "black and white is stored as grayscale"
+        );
+        assert_eq!(bw_image.width(), 900, "no crop yet: the whole photo");
+
+        let corners = core
+            .detect_page_corners(page.id.clone())
+            .unwrap()
+            .unwrap()
+            .corners;
+        let cropped = core.crop_page(page.id.clone(), corners).unwrap();
+        assert_eq!(
+            cropped.filter,
+            PageFilter::BlackAndWhite,
+            "cropping keeps the filter"
+        );
+        assert!(
+            !Path::new(&bw_path).exists(),
+            "previous rendering is removed"
+        );
+        assert!(
+            image::open(cropped.processed_path.as_ref().unwrap())
+                .unwrap()
+                .width()
+                < 900
+        );
+
+        let enhanced = core
+            .set_page_filter(page.id.clone(), PageFilter::Enhanced)
+            .unwrap();
+        assert!(enhanced.corners.is_some(), "filters keep the crop");
+        assert_eq!(core.get_page(page.id.clone()).unwrap(), enhanced);
+
+        // A filtered page exports like any other.
+        let pdf = src.path().join("out.pdf");
+        let options = PdfOptions {
+            paper_size: PaperSize::A4,
+            margin_mm: 0.0,
+        };
+        assert_eq!(
+            core.export_pdf(doc.id, pdf.to_string_lossy().into(), options)
+                .unwrap()
+                .page_count,
+            1
+        );
     }
 
     #[test]

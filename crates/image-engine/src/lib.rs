@@ -4,11 +4,14 @@
 //!   pixels match what the user sees (and what corner coordinates refer to).
 //! - [`correct_perspective`]: turn the quadrilateral outlining a page into
 //!   an upright rectangle, like a flatbed scan.
+//! - [`apply_filter`]: grayscale, black and white, or enhanced color.
 //! - [`save_jpeg`]: encode atomically, never leaving a half-written file.
 
+mod filters;
 mod io;
 mod perspective;
 
+pub use filters::{Filter, apply_filter};
 pub use io::{JPEG_QUALITY, load_oriented, save_jpeg};
 pub use perspective::{MAX_OUTPUT_SIDE, correct_perspective, output_size};
 

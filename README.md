@@ -9,7 +9,7 @@ through [UniFFI](https://mozilla.github.io/uniffi-rs/).
 crates/
   document-engine/   Domain model and use cases (no I/O; defines ports)
   scanner-engine/    Document detection: finds the page corners in a photo
-  image-engine/      Oriented decoding, perspective correction, JPEG encoding
+  image-engine/      Oriented decoding, perspective correction, filters, JPEG encoding
   pdf-engine/        Multi-page PDF export (JPEGs embedded without recompression)
   storage-engine/    SQLite (metadata) + file system (images)
   core-ffi/          Public UniFFI API (lib: nolva_core)
@@ -24,7 +24,7 @@ Crate dependencies: `core-ffi → {storage-engine, image-engine → scanner-engi
 The domain knows nothing about SQLite, image processing or the mobile
 platforms; those are plugged in through ports.
 
-## Current API (v0.4)
+## Current API (v0.5)
 
 ```swift
 let core = try NolvaCore(config: CoreConfig(dataDir: appSupportPath))
@@ -35,6 +35,9 @@ let page = try core.addPage(documentId: doc.id, imagePath: capturedFile.path)
 let corners = try core.detectPageCorners(pageId: page.id)?.corners ?? fullImage
 let cropped = try core.cropPage(pageId: page.id, corners: corners)
 show(cropped.processedPath ?? cropped.originalPath)
+
+// Filters stack on the crop and always start from the original.
+let clean = try core.setPageFilter(pageId: page.id, filter: .enhanced)
 
 // Export: one page per page, cropped images preferred, JPEGs embedded losslessly.
 let info = try core.exportPdf(documentId: doc.id, outputPath: pdfURL.path,
@@ -47,6 +50,7 @@ val doc = core.createDocument("Contract")
 val page = core.addPage(doc.id, capturedFile.absolutePath)
 val detection = core.detectPageCorners(page.id)   // null if no sheet found
 val cropped = core.cropPage(page.id, detection?.corners ?: fullImage)
+val clean = core.setPageFilter(page.id, PageFilter.BLACK_AND_WHITE)
 val info = core.exportPdf(doc.id, pdfFile.absolutePath, PdfOptions(PaperSize.A4, marginMm = 0f))
 
 // Manage: renames, permanent deletes (files included) and reordering.

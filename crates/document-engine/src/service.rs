@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
-use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageId};
+use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
 use crate::ports::{
     CornerDetection, DocumentExporter, DocumentRepository, ExportSummary, PageFileStore,
     PageProcessor, PdfExportOptions,
@@ -162,26 +162,64 @@ where
     }
 
     /// Crops the page to `crop` and stores the perspective-corrected image,
-    /// replacing any previous crop. The original image is never modified,
-    /// so a page can be re-cropped any number of times.
+    /// replacing any previous crop and keeping the page's filter. The
+    /// original image is never modified, so a page can be re-cropped any
+    /// number of times.
+    pub fn crop_page(&self, page_id: PageId, crop: Crop) -> Result<Page, DocumentError> {
+        let page = self.get_page(page_id)?;
+        let filter = page.filter;
+        self.render(page, Some(crop), filter)
+    }
+
+    /// Applies `filter` to the page, on top of its crop if it has one.
+    /// Filters always start from the original, so they can be switched
+    /// freely; [`PageFilter::Original`] on an uncropped page simply shows the
+    /// original again.
+    pub fn set_page_filter(
+        &self,
+        page_id: PageId,
+        filter: PageFilter,
+    ) -> Result<Page, DocumentError> {
+        let page = self.get_page(page_id)?;
+        let crop = page.crop;
+        self.render(page, crop, filter)
+    }
+
+    /// Re-renders `page` with `crop` and `filter`.
     ///
     /// The new image goes to a fresh path and the database is updated only
     /// after it is fully written; the previous processed image is deleted
     /// last. A failure at any step leaves the page exactly as it was.
-    pub fn crop_page(&self, page_id: PageId, crop: Crop) -> Result<Page, DocumentError> {
-        let page = self.get_page(page_id)?;
-        let original = self.files.resolve(&page.original_path);
-        let processed = self.files.new_processed_path(page.document_id, page.id);
-
-        self.processor
-            .render_crop(&original, &crop, &self.files.resolve(&processed))
-            .map_err(|e| processing_error(e, &page))?;
+    fn render(
+        &self,
+        page: Page,
+        crop: Option<Crop>,
+        filter: PageFilter,
+    ) -> Result<Page, DocumentError> {
+        let processed = if crop.is_none() && filter == PageFilter::Original {
+            None
+        } else {
+            let path = self.files.new_processed_path(page.document_id, page.id);
+            let original = self.files.resolve(&page.original_path);
+            self.processor
+                .render_page(&original, crop.as_ref(), filter, &self.files.resolve(&path))
+                .map_err(|e| processing_error(e, &page))?;
+            Some(path)
+        };
 
         let updated = self
             .repository
-            .set_page_crop(page.id, &crop, &processed, self.clock.now_ms())
+            .set_page_rendering(
+                page.id,
+                crop.as_ref(),
+                filter,
+                processed.as_deref(),
+                self.clock.now_ms(),
+            )
             .map_err(|err| {
-                let _ = self.files.remove_file(&processed);
+                if let Some(path) = &processed {
+                    let _ = self.files.remove_file(path);
+                }
                 DocumentError::from(err)
             })?;
 
@@ -311,6 +349,7 @@ mod tests {
                 position: d.page_count,
                 original_path: p.original_path.clone(),
                 crop: None,
+                filter: PageFilter::Original,
                 processed_path: None,
                 created_at_ms: p.created_at_ms,
             };
@@ -399,20 +438,22 @@ mod tests {
             result.sort_by_key(|p| p.position);
             Ok(result)
         }
-        fn set_page_crop(
+        fn set_page_rendering(
             &self,
             id: PageId,
-            crop: &Crop,
-            processed_path: &Path,
+            crop: Option<&Crop>,
+            filter: PageFilter,
+            processed_path: Option<&Path>,
             _updated_at_ms: i64,
         ) -> Result<Page, PortError> {
             if self.fail_set_crop {
-                return Err(PortError::new("set_page_crop", "simulated failure"));
+                return Err(PortError::new("set_page_rendering", "simulated failure"));
             }
             let mut pages = self.pages.lock().unwrap();
             let page = pages.iter_mut().find(|p| p.id == id).unwrap();
-            page.crop = Some(*crop);
-            page.processed_path = Some(processed_path.to_path_buf());
+            page.crop = crop.copied();
+            page.filter = filter;
+            page.processed_path = processed_path.map(Path::to_path_buf);
             Ok(page.clone())
         }
     }
@@ -485,10 +526,11 @@ mod tests {
         ) -> Result<Option<CornerDetection>, ProcessingError> {
             Ok(self.detection)
         }
-        fn render_crop(
+        fn render_page(
             &self,
             _original: &Path,
-            _crop: &Crop,
+            _crop: Option<&Crop>,
+            _filter: PageFilter,
             output: &Path,
         ) -> Result<(), ProcessingError> {
             if let Some(fail) = self.fail_render {
@@ -664,6 +706,64 @@ mod tests {
         assert!(!svc.files().processed.lock().unwrap().contains(&first_path));
         assert_eq!(rendered.lock().unwrap().len(), 2);
         assert_eq!(svc.get_page(page.id).unwrap(), second);
+    }
+
+    #[test]
+    fn filters_keep_the_crop_and_crops_keep_the_filter() {
+        let processor = FakeProcessor::default();
+        let rendered = processor.files.clone();
+        let svc = service_with(InMemoryRepo::default(), processor);
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+
+        // A filter alone renders the whole photo.
+        let filtered = svc
+            .set_page_filter(page.id, PageFilter::BlackAndWhite)
+            .unwrap();
+        assert_eq!(
+            (filtered.crop, filtered.filter),
+            (None, PageFilter::BlackAndWhite)
+        );
+        assert!(filtered.processed_path.is_some());
+
+        let cropped = svc.crop_page(page.id, crop()).unwrap();
+        assert_eq!(
+            (cropped.crop, cropped.filter),
+            (Some(crop()), PageFilter::BlackAndWhite)
+        );
+
+        let refiltered = svc.set_page_filter(page.id, PageFilter::Enhanced).unwrap();
+        assert_eq!(
+            (refiltered.crop, refiltered.filter),
+            (Some(crop()), PageFilter::Enhanced)
+        );
+        assert_eq!(rendered.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn original_filter_without_crop_shows_the_original_again() {
+        let svc = service_with(InMemoryRepo::default(), FakeProcessor::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+
+        let filtered = svc.set_page_filter(page.id, PageFilter::Grayscale).unwrap();
+        let previous = filtered.processed_path.clone().unwrap();
+        svc.files()
+            .processed
+            .lock()
+            .unwrap()
+            .insert(previous.clone());
+
+        let restored = svc.set_page_filter(page.id, PageFilter::Original).unwrap();
+        assert_eq!(restored.processed_path, None);
+        assert_eq!(restored.filter, PageFilter::Original);
+        assert!(!svc.files().processed.lock().unwrap().contains(&previous));
+        assert!(matches!(
+            svc.set_page_filter(PageId::new(), PageFilter::Grayscale),
+            Err(DocumentError::PageNotFound(_))
+        ));
     }
 
     #[test]

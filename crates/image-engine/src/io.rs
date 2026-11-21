@@ -41,10 +41,14 @@ pub fn save_jpeg(image: &DynamicImage, path: &Path) -> Result<(), ImageError> {
     let result = (|| {
         let file = File::create(&partial)?;
         let mut writer = BufWriter::new(file);
-        // JPEG has no alpha channel; documents never need one.
-        JpegEncoder::new_with_quality(&mut writer, JPEG_QUALITY)
-            .encode_image(&image.to_rgb8())
-            .map_err(ImageError::Encode)?;
+        // JPEG has no alpha channel; documents never need one. Grayscale
+        // pages stay single-channel, about a third of the size.
+        let mut encoder = JpegEncoder::new_with_quality(&mut writer, JPEG_QUALITY);
+        match image {
+            DynamicImage::ImageLuma8(gray) => encoder.encode_image(gray),
+            other => encoder.encode_image(&other.to_rgb8()),
+        }
+        .map_err(ImageError::Encode)?;
         let file = writer.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         fs::rename(&partial, path)?;

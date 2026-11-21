@@ -105,10 +105,28 @@ pub struct Page {
     pub original_path: PathBuf,
     /// Outline used for the processed image, if the page was cropped.
     pub crop: Option<Crop>,
-    /// Perspective-corrected image, relative to the storage root. `None`
-    /// until the page is cropped; the original is never modified.
+    /// Filter applied to the processed image.
+    pub filter: PageFilter,
+    /// Cropped and/or filtered image, relative to the storage root. `None`
+    /// while the page has neither a crop nor a filter; the original is never
+    /// modified.
     pub processed_path: Option<PathBuf>,
     pub created_at_ms: i64,
+}
+
+/// Look applied to a page on top of its crop. Filters are re-applied from the
+/// original every time, so switching between them never degrades the image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PageFilter {
+    /// Colors as photographed.
+    #[default]
+    Original,
+    Grayscale,
+    /// Pure black ink on white paper: smallest files, best for text.
+    BlackAndWhite,
+    /// Evens out lighting and shadows, whitens the paper and deepens the
+    /// ink while keeping colors.
+    Enhanced,
 }
 
 /// A page about to be appended; the repository assigns its position.
