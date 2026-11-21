@@ -29,6 +29,51 @@ pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
+/// A grayscale camera preview frame: the luminance (Y) plane as camera APIs
+/// deliver it (Android `ImageProxy.planes[0]`, iOS `CVPixelBuffer` plane 0).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CameraFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes from the start of one row to the next; at least `width`.
+    pub row_stride: u32,
+    pub luma: Vec<u8>,
+    /// Clockwise rotation that makes the frame upright: 0, 90, 180 or 270.
+    pub rotation_degrees: u32,
+}
+
+/// Finds the sheet in a live camera frame, for drawing a guide over the
+/// preview and capturing automatically. Corners are normalized to the
+/// upright frame. Takes a few milliseconds; call it from the camera's
+/// analysis thread, not the main thread. Needs no `NolvaCore`.
+#[uniffi::export]
+pub fn detect_corners_in_frame(frame: CameraFrame) -> Result<Option<CornerDetection>, NolvaError> {
+    let luma = scanner_engine::LumaFrame {
+        width: frame.width,
+        height: frame.height,
+        row_stride: frame.row_stride,
+        pixels: &frame.luma,
+        rotation_degrees: frame.rotation_degrees,
+    };
+    let detection = scanner_engine::detect_document_in_frame(&luma).map_err(|e| {
+        NolvaError::InvalidArgument {
+            reason: e.to_string(),
+        }
+    })?;
+    Ok(detection.map(|d| {
+        let [tl, tr, br, bl] = d.quad.corners().map(|p| NormalizedPoint { x: p.x, y: p.y });
+        CornerDetection {
+            corners: PageCorners {
+                top_left: tl,
+                top_right: tr,
+                bottom_right: br,
+                bottom_left: bl,
+            },
+            confidence: d.confidence,
+        }
+    }))
+}
+
 /// Configuration supplied by the host app at startup.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CoreConfig {
@@ -752,6 +797,39 @@ mod tests {
         assert!(matches!(
             core.delete_document(doc.id),
             Err(NolvaError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn detects_sheets_in_camera_frames() {
+        use image::{GrayImage, Luma};
+        use imageproc::drawing::draw_polygon_mut;
+        use imageproc::point::Point;
+
+        let mut img = GrayImage::from_pixel(480, 640, Luma([40]));
+        let corners = [(60, 50), (420, 60), (430, 590), (50, 600)].map(|(x, y)| Point::new(x, y));
+        draw_polygon_mut(&mut img, &corners, Luma([220]));
+        let frame = CameraFrame {
+            width: 480,
+            height: 640,
+            row_stride: 480,
+            luma: img.into_raw(),
+            rotation_degrees: 0,
+        };
+
+        let detection = detect_corners_in_frame(frame.clone())
+            .unwrap()
+            .expect("sheet not found");
+        assert!(detection.confidence > 0.8);
+        assert!((detection.corners.top_left.x - 60.0 / 480.0).abs() < 0.03);
+
+        let bad = CameraFrame {
+            rotation_degrees: 45,
+            ..frame
+        };
+        assert!(matches!(
+            detect_corners_in_frame(bad),
+            Err(NolvaError::InvalidArgument { .. })
         ));
     }
 

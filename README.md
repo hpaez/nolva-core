@@ -8,7 +8,7 @@ through [UniFFI](https://mozilla.github.io/uniffi-rs/).
 ```text
 crates/
   document-engine/   Domain model and use cases (no I/O; defines ports)
-  scanner-engine/    Document detection: finds the page corners in a photo
+  scanner-engine/    Document detection: finds the page corners in photos and live camera frames
   image-engine/      Oriented decoding, perspective correction, filters, JPEG encoding
   pdf-engine/        Multi-page PDF export (JPEGs embedded without recompression)
   storage-engine/    SQLite (metadata) + file system (images)
@@ -24,7 +24,7 @@ Crate dependencies: `core-ffi → {storage-engine, image-engine → scanner-engi
 The domain knows nothing about SQLite, image processing or the mobile
 platforms; those are plugged in through ports.
 
-## Current API (v0.6)
+## Current API (v0.7)
 
 ```swift
 let core = try NolvaCore(config: CoreConfig(dataDir: appSupportPath))
@@ -52,6 +52,9 @@ val detection = core.detectPageCorners(page.id)   // null if no sheet found
 val cropped = core.cropPage(page.id, detection?.corners ?: fullImage)
 val clean = core.setPageFilter(page.id, PageFilter.BLACK_AND_WHITE)
 val info = core.exportPdf(doc.id, pdfFile.absolutePath, PdfOptions(PaperSize.A4, marginMm = 0f))
+
+// Live guide: detect the sheet in camera preview frames (no NolvaCore needed).
+val live = detectCornersInFrame(CameraFrame(width, height, rowStride, lumaBytes, rotationDegrees))
 
 // Lists carry each document's first page image for thumbnails.
 val covers = core.listDocuments().map { it.coverPath }   // null when empty
