@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::{PortError, ProcessingError};
 use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
@@ -59,6 +61,17 @@ pub trait DocumentRepository: Send + Sync {
         processed_path: Option<&Path>,
         updated_at_ms: i64,
     ) -> Result<Page, PortError>;
+
+    /// Every stored file the database points to: the original and the
+    /// processed image (if any) of every page, relative to the storage root.
+    fn referenced_files(&self) -> Result<Vec<PathBuf>, PortError>;
+}
+
+/// What a cleanup of unreferenced files removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanupSummary {
+    pub files_removed: u32,
+    pub bytes_freed: u64,
 }
 
 /// Storage of page image files.
@@ -89,6 +102,17 @@ pub trait PageFileStore: Send + Sync {
 
     /// Resolves a stored relative path to an absolute one.
     fn resolve(&self, relative: &Path) -> PathBuf;
+
+    /// Deletes stored files that aren't in `referenced` (paths relative to
+    /// the storage root, as [`DocumentRepository::referenced_files`] returns
+    /// them), and the folders left empty. Anything modified within `grace`
+    /// is kept: it may belong to an import or render still in progress,
+    /// whose database row isn't written yet.
+    fn remove_unreferenced(
+        &self,
+        referenced: &HashSet<PathBuf>,
+        grace: Duration,
+    ) -> Result<CleanupSummary, PortError>;
 }
 
 /// Corners found automatically on a page.

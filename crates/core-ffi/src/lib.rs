@@ -198,6 +198,13 @@ pub struct PdfExportInfo {
     pub size_bytes: u64,
 }
 
+/// What [`NolvaCore::remove_orphan_files`] cleaned up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct CleanupInfo {
+    pub files_removed: u32,
+    pub bytes_freed: u64,
+}
+
 /// Errors surfaced to Swift (`throws`) and Kotlin (exceptions).
 ///
 /// `reason` is for logs and diagnostics, not for end users: map the variant
@@ -374,6 +381,18 @@ impl NolvaCore {
         })
     }
 
+    /// Deletes stored images that no page points to anymore (leftovers of
+    /// failed deletions or interrupted imports). Files from the last hour are
+    /// kept, so it is safe while the app is in use. Run it in the background,
+    /// e.g. once per app start; it walks every stored file.
+    pub fn remove_orphan_files(&self) -> Result<CleanupInfo, NolvaError> {
+        let summary = self.service.remove_orphan_files()?;
+        Ok(CleanupInfo {
+            files_removed: summary.files_removed,
+            bytes_freed: summary.bytes_freed,
+        })
+    }
+
     pub fn get_page(&self, page_id: String) -> Result<PageInfo, NolvaError> {
         let id: PageId = page_id.parse()?;
         Ok(self.page_info(self.service.get_page(id)?))
@@ -507,6 +526,30 @@ mod tests {
         let docs = reopened.list_documents().unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].page_count, 1);
+    }
+
+    #[test]
+    fn orphan_cleanup_keeps_live_pages() {
+        let data = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let img = src_dir.path().join("shot.png");
+        std::fs::write(&img, b"png").unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Boleta".into()).unwrap();
+        let page = core
+            .add_page(doc.id, img.to_string_lossy().into_owned())
+            .unwrap();
+
+        // Everything is recent, so nothing qualifies yet.
+        let info = core.remove_orphan_files().unwrap();
+        assert_eq!(
+            info,
+            CleanupInfo {
+                files_removed: 0,
+                bytes_freed: 0
+            }
+        );
+        assert!(Path::new(&page.original_path).exists());
     }
 
     #[test]
