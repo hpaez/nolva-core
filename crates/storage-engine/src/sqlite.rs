@@ -453,6 +453,20 @@ impl DocumentRepository for SqliteDocumentRepository {
             .map_err(|e| PortError::new("set page rendering", e))?;
         Ok(page)
     }
+
+    fn referenced_files(&self) -> Result<Vec<PathBuf>, PortError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT original_path FROM pages
+                 UNION ALL
+                 SELECT processed_path FROM pages WHERE processed_path IS NOT NULL",
+            )
+            .map_err(|e| PortError::new("list referenced files", e))?;
+        stmt.query_map([], |row| row.get::<_, String>(0).map(PathBuf::from))
+            .and_then(Iterator::collect)
+            .map_err(|e| PortError::new("list referenced files", e))
+    }
 }
 
 #[cfg(test)]
@@ -621,6 +635,38 @@ mod tests {
         assert_eq!(cover(), Some(PathBuf::from("p.jpg")));
         repo.move_page(second.id, 0, 5).unwrap();
         assert_eq!(cover(), Some(second.original_path));
+    }
+
+    #[test]
+    fn referenced_files_lists_originals_and_processed_images() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        assert!(repo.referenced_files().unwrap().is_empty());
+
+        let first = repo.append_page(&new_page(d.id, 2)).unwrap();
+        let second = repo.append_page(&new_page(d.id, 3)).unwrap();
+        repo.set_page_rendering(
+            first.id,
+            None,
+            PageFilter::Grayscale,
+            Some(Path::new("p.jpg")),
+            4,
+        )
+        .unwrap();
+
+        let mut files = repo.referenced_files().unwrap();
+        files.sort();
+        let mut expected = vec![
+            first.original_path,
+            second.original_path,
+            PathBuf::from("p.jpg"),
+        ];
+        expected.sort();
+        assert_eq!(files, expected);
+
+        repo.delete_document(d.id).unwrap();
+        assert!(repo.referenced_files().unwrap().is_empty());
     }
 
     fn ids(pages: &[Page]) -> Vec<PageId> {

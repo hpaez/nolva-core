@@ -1,15 +1,22 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
 use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
 use crate::ports::{
-    CornerDetection, DocumentExporter, DocumentRepository, ExportSummary, PageFileStore,
-    PageProcessor, PdfExportOptions,
+    CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, ExportSummary,
+    PageFileStore, PageProcessor, PdfExportOptions,
 };
 
 /// Maximum length of a document title, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
+
+/// Files younger than this survive [`DocumentService::remove_orphan_files`]:
+/// an import or render may have written them and not yet saved the row
+/// that points to them. Far longer than any such operation takes.
+pub const ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// Document use cases, independent of storage technology and platform.
 #[derive(Debug)]
@@ -80,6 +87,17 @@ where
         }
         let _ = self.files.remove_document_files(id);
         Ok(())
+    }
+
+    /// Deletes stored images that no page points to anymore: leftovers of
+    /// deletions or re-renders whose file cleanup failed, or of imports that
+    /// crashed halfway. Safe to run at any time, e.g. once per app start in
+    /// the background; recent files are kept (see [`ORPHAN_GRACE`]).
+    pub fn remove_orphan_files(&self) -> Result<CleanupSummary, DocumentError> {
+        // Read the references first: a file written after this snapshot is
+        // newer than the grace period, so it can't be removed by mistake.
+        let referenced: HashSet<_> = self.repository.referenced_files()?.into_iter().collect();
+        Ok(self.files.remove_unreferenced(&referenced, ORPHAN_GRACE)?)
     }
 
     /// Deletes a page and its images; later pages move up one position.
@@ -457,6 +475,15 @@ mod tests {
             page.processed_path = processed_path.map(Path::to_path_buf);
             Ok(page.clone())
         }
+        fn referenced_files(&self) -> Result<Vec<PathBuf>, PortError> {
+            let pages = self.pages.lock().unwrap();
+            Ok(pages
+                .iter()
+                .flat_map(|p| {
+                    std::iter::once(p.original_path.clone()).chain(p.processed_path.clone())
+                })
+                .collect())
+        }
     }
 
     fn renumber(pages: &mut [Page], document_id: DocumentId) {
@@ -478,6 +505,8 @@ mod tests {
         removed_pages: Mutex<Vec<PageId>>,
         processed: Mutex<HashSet<PathBuf>>,
         counter: Mutex<u32>,
+        /// What the last cleanup was asked to keep, and with which grace.
+        swept: Mutex<Option<(HashSet<PathBuf>, Duration)>>,
     }
 
     impl PageFileStore for FakeFiles {
@@ -509,6 +538,17 @@ mod tests {
         }
         fn resolve(&self, relative: &Path) -> PathBuf {
             relative.to_path_buf()
+        }
+        fn remove_unreferenced(
+            &self,
+            referenced: &HashSet<PathBuf>,
+            grace: Duration,
+        ) -> Result<CleanupSummary, PortError> {
+            *self.swept.lock().unwrap() = Some((referenced.clone(), grace));
+            Ok(CleanupSummary {
+                files_removed: 2,
+                bytes_freed: 10,
+            })
         }
     }
 
@@ -924,5 +964,28 @@ mod tests {
                 .enumerate()
                 .all(|(i, p)| p.position == i as u32)
         );
+    }
+
+    #[test]
+    fn orphan_cleanup_keeps_every_referenced_file() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let plain = svc.add_page(doc.id, &img).unwrap();
+        let cropped = svc.add_page(doc.id, &img).unwrap();
+        let cropped = svc.crop_page(cropped.id, crop()).unwrap();
+
+        let summary = svc.remove_orphan_files().unwrap();
+
+        assert_eq!(summary.files_removed, 2);
+        let (kept, grace) = svc.files().swept.lock().unwrap().clone().unwrap();
+        let expected: HashSet<PathBuf> = [
+            plain.original_path,
+            cropped.original_path,
+            cropped.processed_path.unwrap(),
+        ]
+        .into();
+        assert_eq!(kept, expected);
+        assert_eq!(grace, ORPHAN_GRACE);
     }
 }
