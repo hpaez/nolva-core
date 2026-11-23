@@ -62,6 +62,15 @@ pub enum DocumentError {
     #[error("source image not found: {}", .0.display())]
     SourceImageNotFound(PathBuf),
 
+    #[error("invalid recognized text: {reason}")]
+    InvalidText { reason: String },
+
+    /// The page's image changed while its text was being recognized, so the
+    /// result no longer applies. The page shows up again in
+    /// `pages_needing_text`.
+    #[error("page image changed during recognition: {0}")]
+    PageImageChanged(PageId),
+
     #[error("unsupported image format: {extension}")]
     UnsupportedImageFormat { extension: String },
 
