@@ -9,9 +9,13 @@ use crate::ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, ExportSummary,
     PageFileStore, PageProcessor, PdfExportOptions,
 };
+use crate::text::{PageText, TextLine, TextMatch, normalize_lines};
 
 /// Maximum length of a document title, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
+
+/// Most search results returned.
+pub const MAX_SEARCH_RESULTS: u32 = 50;
 
 /// Files younger than this survive [`DocumentService::remove_orphan_files`]:
 /// an import or render may have written them and not yet saved the row
@@ -87,6 +91,57 @@ where
         }
         let _ = self.files.remove_document_files(id);
         Ok(())
+    }
+
+    /// Up to `limit` pages whose text still has to be recognized: new pages,
+    /// and pages whose image changed (re-cropped or filtered) since. Newest
+    /// first, so what the user just scanned becomes searchable first.
+    pub fn pages_needing_text(&self, limit: u32) -> Result<Vec<Page>, DocumentError> {
+        Ok(self.repository.pages_without_text(limit)?)
+    }
+
+    /// Stores the text recognized in `image`, which must be the page's
+    /// displayed image as handed out (absolute path). If the page shows a
+    /// different image by now, fails with [`DocumentError::PageImageChanged`]
+    /// and the page stays pending.
+    pub fn save_page_text(
+        &self,
+        page_id: PageId,
+        image: &Path,
+        lines: Vec<TextLine>,
+    ) -> Result<PageText, DocumentError> {
+        let page = self.get_page(page_id)?;
+        let current = displayed_image(&page);
+        if self.files.resolve(&current) != image {
+            return Err(DocumentError::PageImageChanged(page_id));
+        }
+        let text = PageText {
+            page_id,
+            source_path: current,
+            lines: normalize_lines(lines)?,
+            recognized_at_ms: self.clock.now_ms(),
+        };
+        self.repository.save_page_text(&text, &text.plain_text())?;
+        Ok(text)
+    }
+
+    /// The page's text, if it was recognized in the image the page shows
+    /// now. `None` while recognition is pending.
+    pub fn page_text(&self, page_id: PageId) -> Result<Option<PageText>, DocumentError> {
+        let page = self.get_page(page_id)?;
+        let current = displayed_image(&page);
+        Ok(self
+            .repository
+            .get_page_text(page_id)?
+            .filter(|text| text.source_path == current))
+    }
+
+    /// Pages whose text contains every word of `query`, best match first.
+    pub fn search_text(&self, query: &str) -> Result<Vec<TextMatch>, DocumentError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self.repository.search_text(query, MAX_SEARCH_RESULTS)?)
     }
 
     /// Deletes stored images that no page points to anymore: leftovers of
@@ -320,6 +375,13 @@ fn normalize_title(title: &str) -> Result<String, DocumentError> {
     Ok(trimmed.to_owned())
 }
 
+/// The image a page shows: its processed image, or the original.
+fn displayed_image(page: &Page) -> std::path::PathBuf {
+    page.processed_path
+        .clone()
+        .unwrap_or_else(|| page.original_path.clone())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -343,6 +405,8 @@ mod tests {
         pages: Mutex<Vec<Page>>,
         fail_append: bool,
         fail_set_crop: bool,
+        texts: Mutex<HashMap<PageId, (PageText, String)>>,
+        searched: Mutex<Option<String>>,
     }
 
     impl DocumentRepository for InMemoryRepo {
@@ -474,6 +538,41 @@ mod tests {
             page.filter = filter;
             page.processed_path = processed_path.map(Path::to_path_buf);
             Ok(page.clone())
+        }
+        fn save_page_text(&self, text: &PageText, plain: &str) -> Result<(), PortError> {
+            self.texts
+                .lock()
+                .unwrap()
+                .insert(text.page_id, (text.clone(), plain.to_owned()));
+            Ok(())
+        }
+        fn get_page_text(&self, page_id: PageId) -> Result<Option<PageText>, PortError> {
+            Ok(self
+                .texts
+                .lock()
+                .unwrap()
+                .get(&page_id)
+                .map(|(t, _)| t.clone()))
+        }
+        fn pages_without_text(&self, limit: u32) -> Result<Vec<Page>, PortError> {
+            let texts = self.texts.lock().unwrap();
+            Ok(self
+                .pages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| {
+                    texts
+                        .get(&p.id)
+                        .is_none_or(|(t, _)| t.source_path != displayed_image(p))
+                })
+                .take(limit as usize)
+                .cloned()
+                .collect())
+        }
+        fn search_text(&self, query: &str, _limit: u32) -> Result<Vec<TextMatch>, PortError> {
+            *self.searched.lock().unwrap() = Some(query.to_owned());
+            Ok(Vec::new())
         }
         fn referenced_files(&self) -> Result<Vec<PathBuf>, PortError> {
             let pages = self.pages.lock().unwrap();
@@ -987,5 +1086,71 @@ mod tests {
         .into();
         assert_eq!(kept, expected);
         assert_eq!(grace, ORPHAN_GRACE);
+    }
+
+    fn text_line(block: u32, text: &str) -> TextLine {
+        TextLine {
+            block,
+            text: text.into(),
+            bounds: crate::TextBounds::new(0.1, 0.1, 0.9, 0.2).unwrap(),
+        }
+    }
+
+    #[test]
+    fn recognized_text_follows_the_displayed_image() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        assert_eq!(svc.pages_needing_text(10).unwrap(), vec![page.clone()]);
+        assert_eq!(svc.page_text(page.id).unwrap(), None);
+
+        let image = svc.files().resolve(&page.original_path);
+        let saved = svc
+            .save_page_text(
+                page.id,
+                &image,
+                vec![text_line(0, " Boleta "), text_line(1, "Total")],
+            )
+            .unwrap();
+        assert_eq!(saved.plain_text(), "Boleta\n\nTotal");
+        assert_eq!(saved.recognized_at_ms, 1_000);
+        assert_eq!(svc.page_text(page.id).unwrap(), Some(saved));
+        assert!(svc.pages_needing_text(10).unwrap().is_empty());
+
+        // Cropping changes the image: the old text no longer applies.
+        let cropped = svc.crop_page(page.id, crop()).unwrap();
+        assert_eq!(svc.page_text(page.id).unwrap(), None);
+        assert_eq!(svc.pages_needing_text(10).unwrap(), vec![cropped]);
+    }
+
+    #[test]
+    fn text_from_an_outdated_image_is_rejected() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        let before = svc.files().resolve(&page.original_path);
+        svc.crop_page(page.id, crop()).unwrap();
+
+        assert!(matches!(
+            svc.save_page_text(page.id, &before, vec![text_line(0, "x")]),
+            Err(DocumentError::PageImageChanged(id)) if id == page.id
+        ));
+        assert!(matches!(
+            svc.save_page_text(PageId::new(), &before, vec![]),
+            Err(DocumentError::PageNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn blank_searches_skip_the_index() {
+        let svc = service(InMemoryRepo::default());
+        assert!(svc.search_text("   ").unwrap().is_empty());
+        svc.search_text("boleta luz").unwrap();
+        assert_eq!(
+            svc.repository.searched.lock().unwrap().as_deref(),
+            Some("boleta luz")
+        );
     }
 }

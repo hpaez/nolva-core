@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use document_engine::{
-    Crop, Document, DocumentId, DocumentRepository, NewPage, Page, PageFilter, PageId, PortError,
+    Crop, Document, DocumentId, DocumentRepository, NewPage, Page, PageFilter, PageId, PageText,
+    PortError, TextBounds, TextLine, TextMatch,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -74,6 +75,19 @@ fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
         page_count: row.get(4)?,
         cover_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
     })
+}
+
+/// Turns user input into an FTS5 query: every word must match, each as a
+/// prefix ("fact" finds "factura"). Words are quoted, so operators and
+/// punctuation typed by the user are taken literally, never as syntax.
+/// `None` when the input has no searchable characters.
+fn fts_query(input: &str) -> Option<String> {
+    let terms: Vec<String> = input
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
 }
 
 const PAGE_COLUMNS: &str =
@@ -467,6 +481,155 @@ impl DocumentRepository for SqliteDocumentRepository {
             .and_then(Iterator::collect)
             .map_err(|e| PortError::new("list referenced files", e))
     }
+
+    fn save_page_text(&self, text: &PageText, plain_text: &str) -> Result<(), PortError> {
+        let ctx = "save page text";
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PortError::new(ctx, e))?;
+        let page_id = text.page_id.to_string();
+        // Delete then insert (not REPLACE): the delete trigger then removes
+        // the old entry from the search index.
+        tx.execute(
+            "DELETE FROM page_texts WHERE page_id = ?1",
+            params![page_id],
+        )
+        .map_err(|e| PortError::new(ctx, e))?;
+        tx.execute(
+            "INSERT INTO page_texts (page_id, source_path, text, recognized_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                page_id,
+                text.source_path.to_string_lossy(),
+                plain_text,
+                text.recognized_at_ms
+            ],
+        )
+        .map_err(|e| PortError::new(ctx, e))?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO page_text_lines
+                     (page_id, line_index, block_index, text, left, top, right, bottom)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .map_err(|e| PortError::new(ctx, e))?;
+            for (index, line) in text.lines.iter().enumerate() {
+                let b = line.bounds;
+                insert
+                    .execute(params![
+                        page_id,
+                        index as i64,
+                        line.block,
+                        line.text,
+                        b.left,
+                        b.top,
+                        b.right,
+                        b.bottom
+                    ])
+                    .map_err(|e| PortError::new(ctx, e))?;
+            }
+        }
+        tx.commit().map_err(|e| PortError::new(ctx, e))
+    }
+
+    fn get_page_text(&self, page_id: PageId) -> Result<Option<PageText>, PortError> {
+        let ctx = "get page text";
+        let conn = self.conn();
+        let id = page_id.to_string();
+        let Some((source_path, recognized_at_ms)) = conn
+            .query_row(
+                "SELECT source_path, recognized_at_ms FROM page_texts WHERE page_id = ?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|e| PortError::new(ctx, e))?
+        else {
+            return Ok(None);
+        };
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT block_index, text, left, top, right, bottom FROM page_text_lines
+                 WHERE page_id = ?1 ORDER BY line_index",
+            )
+            .map_err(|e| PortError::new(ctx, e))?;
+        let lines = stmt
+            .query_map(params![id], |row| {
+                let bounds = TextBounds::new(row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Real,
+                            e.into(),
+                        )
+                    })?;
+                Ok(TextLine {
+                    block: row.get(0)?,
+                    text: row.get(1)?,
+                    bounds,
+                })
+            })
+            .and_then(Iterator::collect)
+            .map_err(|e| PortError::new(ctx, e))?;
+        Ok(Some(PageText {
+            page_id,
+            source_path: PathBuf::from(source_path),
+            lines,
+            recognized_at_ms,
+        }))
+    }
+
+    fn pages_without_text(&self, limit: u32) -> Result<Vec<Page>, PortError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(&format!(
+                "SELECT {PAGE_COLUMNS} FROM pages
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM page_texts t
+                     WHERE t.page_id = pages.id
+                       AND t.source_path = COALESCE(pages.processed_path, pages.original_path))
+                 ORDER BY created_at_ms DESC, id
+                 LIMIT ?1"
+            ))
+            .map_err(|e| PortError::new("list pages without text", e))?;
+        stmt.query_map(params![limit], page_from_row)
+            .and_then(Iterator::collect)
+            .map_err(|e| PortError::new("list pages without text", e))
+    }
+
+    fn search_text(&self, query: &str, limit: u32) -> Result<Vec<TextMatch>, PortError> {
+        let Some(fts) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.conn();
+        // Only current text counts: a page re-cropped since recognition
+        // waits for its new text before it is found again.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT p.document_id, p.id, p.position,
+                        snippet(page_text_search, 0, '', '', '…', 12)
+                 FROM page_text_search
+                 JOIN page_texts t ON t.rowid = page_text_search.rowid
+                 JOIN pages p ON p.id = t.page_id
+                 WHERE page_text_search MATCH ?1
+                   AND t.source_path = COALESCE(p.processed_path, p.original_path)
+                 ORDER BY rank
+                 LIMIT ?2",
+            )
+            .map_err(|e| PortError::new("search text", e))?;
+        stmt.query_map(params![fts, limit], |row| {
+            Ok(TextMatch {
+                document_id: parse_id(row, 0)?,
+                page_id: parse_id(row, 1)?,
+                page_position: row.get(2)?,
+                snippet: row.get(3)?,
+            })
+        })
+        .and_then(Iterator::collect)
+        .map_err(|e| PortError::new("search text", e))
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +798,196 @@ mod tests {
         assert_eq!(cover(), Some(PathBuf::from("p.jpg")));
         repo.move_page(second.id, 0, 5).unwrap();
         assert_eq!(cover(), Some(second.original_path));
+    }
+
+    fn page_text(page: &Page, source: &str, lines: &[(u32, &str)]) -> PageText {
+        PageText {
+            page_id: page.id,
+            source_path: PathBuf::from(source),
+            lines: lines
+                .iter()
+                .map(|&(block, text)| TextLine {
+                    block,
+                    text: text.into(),
+                    bounds: TextBounds::new(0.1, 0.2, 0.8, 0.25).unwrap(),
+                })
+                .collect(),
+            recognized_at_ms: 9,
+        }
+    }
+
+    fn save(repo: &SqliteDocumentRepository, text: &PageText) {
+        repo.save_page_text(text, &text.plain_text()).unwrap();
+    }
+
+    fn search(repo: &SqliteDocumentRepository, query: &str) -> Vec<PageId> {
+        repo.search_text(query, 50)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.page_id)
+            .collect()
+    }
+
+    #[test]
+    fn page_text_round_trips_and_replaces() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let page = repo.append_page(&new_page(d.id, 2)).unwrap();
+        assert_eq!(repo.get_page_text(page.id).unwrap(), None);
+
+        let first = page_text(
+            &page,
+            "a.jpg",
+            &[(0, "Factura"), (0, "Nº 12"), (1, "Total")],
+        );
+        save(&repo, &first);
+        assert_eq!(repo.get_page_text(page.id).unwrap(), Some(first));
+
+        let second = page_text(&page, "b.jpg", &[(0, "Boleta")]);
+        save(&repo, &second);
+        assert_eq!(repo.get_page_text(page.id).unwrap(), Some(second));
+    }
+
+    #[test]
+    fn pages_without_text_tracks_the_displayed_image() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let older = repo.append_page(&new_page(d.id, 2)).unwrap();
+        let newer = repo.append_page(&new_page(d.id, 3)).unwrap();
+        let pending = |limit| ids(&repo.pages_without_text(limit).unwrap());
+        assert_eq!(pending(10), vec![newer.id, older.id], "newest first");
+        assert_eq!(pending(1), vec![newer.id]);
+
+        let original = older.original_path.to_string_lossy().into_owned();
+        save(&repo, &page_text(&older, &original, &[(0, "hola")]));
+        assert_eq!(pending(10), vec![newer.id]);
+
+        // A new processed image makes the stored text outdated.
+        repo.set_page_rendering(
+            older.id,
+            None,
+            PageFilter::Grayscale,
+            Some(Path::new("g.jpg")),
+            4,
+        )
+        .unwrap();
+        assert_eq!(pending(10), vec![newer.id, older.id]);
+    }
+
+    #[test]
+    fn search_ignores_case_and_accents_and_matches_prefixes() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let invoice = repo.append_page(&new_page(d.id, 2)).unwrap();
+        let receipt = repo.append_page(&new_page(d.id, 3)).unwrap();
+        let path = |p: &Page| p.original_path.to_string_lossy().into_owned();
+        save(
+            &repo,
+            &page_text(
+                &invoice,
+                &path(&invoice),
+                &[(0, "FACTURA ELECTRÓNICA"), (1, "Dirección: Av. Perú 123")],
+            ),
+        );
+        save(
+            &repo,
+            &page_text(
+                &receipt,
+                &path(&receipt),
+                &[(0, "Boleta de venta"), (0, "Peru")],
+            ),
+        );
+
+        assert_eq!(search(&repo, "electronica"), vec![invoice.id]);
+        assert_eq!(
+            search(&repo, "fact direc"),
+            vec![invoice.id],
+            "prefixes, all words"
+        );
+        assert_eq!(search(&repo, "boleta factura"), Vec::<PageId>::new());
+        let mut peru = search(&repo, "perú");
+        peru.sort_by_key(|id| id.to_string());
+        let mut both = vec![invoice.id, receipt.id];
+        both.sort_by_key(|id| id.to_string());
+        assert_eq!(peru, both);
+
+        let hit = &repo.search_text("boleta", 50).unwrap()[0];
+        assert_eq!((hit.document_id, hit.page_position), (d.id, 1));
+        assert!(hit.snippet.contains("Boleta"), "{}", hit.snippet);
+    }
+
+    #[test]
+    fn search_input_is_never_parsed_as_syntax() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let page = repo.append_page(&new_page(d.id, 2)).unwrap();
+        let path = page.original_path.to_string_lossy().into_owned();
+        save(
+            &repo,
+            &page_text(&page, &path, &[(0, "Total \"neto\" OR NOT 3/2026")]),
+        );
+
+        for query in [
+            "\"", "*", "-", "NOT", "neto\"", "AND OR", "(", "3/2026", "text:x",
+        ] {
+            repo.search_text(query, 50)
+                .unwrap_or_else(|e| panic!("{query:?}: {e}"));
+        }
+        assert_eq!(search(&repo, "\"neto"), vec![page.id]);
+        assert_eq!(search(&repo, "3/2026"), vec![page.id]);
+        assert!(search(&repo, "  -- ").is_empty());
+    }
+
+    #[test]
+    fn search_skips_outdated_text_and_deleted_pages() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let page = repo.append_page(&new_page(d.id, 2)).unwrap();
+        let path = page.original_path.to_string_lossy().into_owned();
+        save(&repo, &page_text(&page, &path, &[(0, "contrato")]));
+        assert_eq!(search(&repo, "contrato"), vec![page.id]);
+
+        repo.set_page_rendering(
+            page.id,
+            None,
+            PageFilter::Grayscale,
+            Some(Path::new("g.jpg")),
+            3,
+        )
+        .unwrap();
+        assert!(search(&repo, "contrato").is_empty(), "outdated");
+        save(&repo, &page_text(&page, "g.jpg", &[(0, "contrato")]));
+        assert_eq!(search(&repo, "contrato"), vec![page.id]);
+
+        repo.delete_document(d.id).unwrap();
+        assert!(search(&repo, "contrato").is_empty());
+        let conn = repo.conn();
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM page_text_search", [], |r| r.get(0))
+            .unwrap();
+        let lines: i64 = conn
+            .query_row("SELECT COUNT(*) FROM page_text_lines", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            (indexed, lines),
+            (0, 0),
+            "cascades clear the index and lines"
+        );
+    }
+
+    #[test]
+    fn fts_queries_quote_every_word() {
+        assert_eq!(
+            fts_query("  hola  mundo "),
+            Some("\"hola\"* \"mundo\"*".into())
+        );
+        assert_eq!(fts_query("di\"jo"), Some("\"di\"\"jo\"*".into()));
+        assert_eq!(fts_query(" - * "), None);
     }
 
     #[test]

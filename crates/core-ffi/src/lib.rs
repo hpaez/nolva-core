@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use document_engine::{
     Crop, Document, DocumentError, DocumentId, DocumentService, Page, PageFileStore, PageId,
-    PdfExportOptions, SystemClock,
+    PageText, PdfExportOptions, SystemClock, TextBounds, TextLine,
 };
 use storage_engine::{DATABASE_FILE_NAME, LocalPageFileStore, SqliteDocumentRepository};
 
@@ -198,6 +198,45 @@ pub struct PdfExportInfo {
     pub size_bytes: u64,
 }
 
+/// Rectangle in normalized coordinates (`0.0..=1.0`) of the page image the
+/// text was recognized in, origin at the top left.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct TextRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+/// One line of recognized text, as the platform recognizer reports it.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct RecognizedLine {
+    /// Block (paragraph or column) index in reading order; lines of the same
+    /// block are consecutive.
+    pub block: u32,
+    pub text: String,
+    pub bounds: TextRect,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PageTextInfo {
+    pub page_id: String,
+    /// All the text: lines separated by newlines, blocks by a blank line.
+    pub text: String,
+    pub lines: Vec<RecognizedLine>,
+    pub recognized_at_ms: i64,
+}
+
+/// A page whose text matches a search.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TextSearchHit {
+    pub document_id: String,
+    pub page_id: String,
+    pub page_position: u32,
+    /// Short excerpt around the match.
+    pub snippet: String,
+}
+
 /// What [`NolvaCore::remove_orphan_files`] cleaned up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct CleanupInfo {
@@ -220,6 +259,9 @@ pub enum NolvaError {
     Unsupported { reason: String },
     #[error("storage error: {reason}")]
     Storage { reason: String },
+    /// The data changed while the operation ran; it no longer applies.
+    #[error("conflict: {reason}")]
+    Conflict { reason: String },
 }
 
 impl From<DocumentError> for NolvaError {
@@ -229,7 +271,9 @@ impl From<DocumentError> for NolvaError {
             DocumentError::InvalidTitle { .. }
             | DocumentError::InvalidId { .. }
             | DocumentError::InvalidCorners { .. }
-            | DocumentError::EmptyDocument(_) => Self::InvalidArgument { reason },
+            | DocumentError::EmptyDocument(_)
+            | DocumentError::InvalidText { .. } => Self::InvalidArgument { reason },
+            DocumentError::PageImageChanged(_) => Self::Conflict { reason },
             DocumentError::DocumentNotFound(_)
             | DocumentError::PageNotFound(_)
             | DocumentError::SourceImageNotFound(_) => Self::NotFound { reason },
@@ -381,6 +425,71 @@ impl NolvaCore {
         })
     }
 
+    /// Up to `limit` pages whose text still has to be recognized, newest
+    /// first: new pages and pages whose image changed since. Recognize each
+    /// one's displayed image (`processed_path`, else `original_path`) and
+    /// pass the result to [`Self::save_page_text`].
+    pub fn pages_needing_text(&self, limit: u32) -> Result<Vec<PageInfo>, NolvaError> {
+        Ok(self
+            .service
+            .pages_needing_text(limit)?
+            .into_iter()
+            .map(|p| self.page_info(p))
+            .collect())
+    }
+
+    /// Stores the text recognized in `image_path`, the page's displayed
+    /// image as [`PageInfo`] gave it. Fails with `Conflict` if the page
+    /// shows another image by now (it was re-cropped meanwhile): drop the
+    /// result, the page is pending again. Lines in reading order; blank
+    /// lines are dropped and boxes are clamped into the image.
+    pub fn save_page_text(
+        &self,
+        page_id: String,
+        image_path: String,
+        lines: Vec<RecognizedLine>,
+    ) -> Result<PageTextInfo, NolvaError> {
+        let id: PageId = page_id.parse()?;
+        let lines = lines
+            .into_iter()
+            .map(|l| {
+                let b = l.bounds;
+                Ok(TextLine {
+                    block: l.block,
+                    text: l.text,
+                    bounds: TextBounds::new(b.left, b.top, b.right, b.bottom)?,
+                })
+            })
+            .collect::<Result<Vec<_>, DocumentError>>()?;
+        let text = self
+            .service
+            .save_page_text(id, Path::new(&image_path), lines)?;
+        Ok(page_text_info(text))
+    }
+
+    /// The page's recognized text, or `None` while recognition is pending.
+    pub fn get_page_text(&self, page_id: String) -> Result<Option<PageTextInfo>, NolvaError> {
+        let id: PageId = page_id.parse()?;
+        Ok(self.service.page_text(id)?.map(page_text_info))
+    }
+
+    /// Pages whose text contains every word of `query` (as typed by the
+    /// user; prefixes match, case and accents are ignored), best first, at
+    /// most 50.
+    pub fn search_text(&self, query: String) -> Result<Vec<TextSearchHit>, NolvaError> {
+        Ok(self
+            .service
+            .search_text(&query)?
+            .into_iter()
+            .map(|m| TextSearchHit {
+                document_id: m.document_id.to_string(),
+                page_id: m.page_id.to_string(),
+                page_position: m.page_position,
+                snippet: m.snippet,
+            })
+            .collect())
+    }
+
     /// Deletes stored images that no page points to anymore (leftovers of
     /// failed deletions or interrupted imports). Files from the last hour are
     /// kept, so it is safe while the app is in use. Run it in the background,
@@ -465,6 +574,28 @@ impl NolvaCore {
     }
 }
 
+fn page_text_info(text: PageText) -> PageTextInfo {
+    PageTextInfo {
+        page_id: text.page_id.to_string(),
+        text: text.plain_text(),
+        lines: text
+            .lines
+            .into_iter()
+            .map(|l| RecognizedLine {
+                block: l.block,
+                text: l.text,
+                bounds: TextRect {
+                    left: l.bounds.left,
+                    top: l.bounds.top,
+                    right: l.bounds.right,
+                    bottom: l.bounds.bottom,
+                },
+            })
+            .collect(),
+        recognized_at_ms: text.recognized_at_ms,
+    }
+}
+
 impl From<Crop> for PageCorners {
     fn from(crop: Crop) -> Self {
         let [tl, tr, br, bl] = crop.corners().map(|(x, y)| NormalizedPoint { x, y });
@@ -526,6 +657,82 @@ mod tests {
         let docs = reopened.list_documents().unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].page_count, 1);
+    }
+
+    fn line(block: u32, text: &str) -> RecognizedLine {
+        RecognizedLine {
+            block,
+            text: text.into(),
+            bounds: TextRect {
+                left: 0.1,
+                top: 0.1,
+                right: 0.9,
+                bottom: 0.15,
+            },
+        }
+    }
+
+    #[test]
+    fn recognized_text_end_to_end() {
+        let data = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let img = src_dir.path().join("shot.png");
+        std::fs::write(&img, b"png").unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Arriendo".into()).unwrap();
+        let page = core
+            .add_page(doc.id.clone(), img.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert_eq!(core.pages_needing_text(5).unwrap(), vec![page.clone()]);
+        assert_eq!(core.get_page_text(page.id.clone()).unwrap(), None);
+
+        let saved = core
+            .save_page_text(
+                page.id.clone(),
+                page.original_path.clone(),
+                vec![line(0, "Contrato de arriendo"), line(1, "Valparaíso")],
+            )
+            .unwrap();
+        assert_eq!(saved.text, "Contrato de arriendo\n\nValparaíso");
+        assert_eq!(core.get_page_text(page.id.clone()).unwrap(), Some(saved));
+        assert!(core.pages_needing_text(5).unwrap().is_empty());
+
+        let hits = core.search_text("valparaiso arrien".into()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            (hits[0].document_id.as_str(), hits[0].page_id.as_str()),
+            (doc.id.as_str(), page.id.as_str())
+        );
+        assert!(core.search_text("  ".into()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_for_another_image_is_a_conflict() {
+        let data = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let img = src_dir.path().join("shot.png");
+        std::fs::write(&img, b"png").unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Doc".into()).unwrap();
+        let page = core
+            .add_page(doc.id, img.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(matches!(
+            core.save_page_text(
+                page.id.clone(),
+                "/elsewhere/x.jpg".into(),
+                vec![line(0, "x")]
+            ),
+            Err(NolvaError::Conflict { .. })
+        ));
+        let mut inverted = line(0, "x");
+        inverted.bounds.left = 0.95;
+        assert!(matches!(
+            core.save_page_text(page.id, page.original_path, vec![inverted]),
+            Err(NolvaError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

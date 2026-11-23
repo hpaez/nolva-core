@@ -36,6 +36,46 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE pages ADD COLUMN filter TEXT NOT NULL DEFAULT 'original'
         CHECK (filter IN ('original', 'grayscale', 'black_and_white', 'enhanced'));
     "#,
+    // 4: recognized text. `source_path` is the image the text came from;
+    // the text is current while it equals the page's displayed image.
+    // `page_text_search` indexes `page_texts.text` by rowid and is kept in
+    // step by triggers, which also fire on cascaded deletes.
+    r#"
+    CREATE TABLE page_texts (
+        page_id          TEXT PRIMARY KEY NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        source_path      TEXT NOT NULL,
+        text             TEXT NOT NULL,
+        recognized_at_ms INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE page_text_lines (
+        page_id     TEXT NOT NULL REFERENCES page_texts(page_id) ON DELETE CASCADE,
+        line_index  INTEGER NOT NULL CHECK (line_index >= 0),
+        block_index INTEGER NOT NULL CHECK (block_index >= 0),
+        text        TEXT NOT NULL,
+        left        REAL NOT NULL,
+        top         REAL NOT NULL,
+        right       REAL NOT NULL,
+        bottom      REAL NOT NULL,
+        PRIMARY KEY (page_id, line_index)
+    ) STRICT;
+
+    CREATE VIRTUAL TABLE page_text_search USING fts5(
+        text,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+
+    CREATE TRIGGER page_texts_after_insert AFTER INSERT ON page_texts BEGIN
+        INSERT INTO page_text_search(rowid, text) VALUES (new.rowid, new.text);
+    END;
+    CREATE TRIGGER page_texts_after_delete AFTER DELETE ON page_texts BEGIN
+        DELETE FROM page_text_search WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER page_texts_after_update AFTER UPDATE OF text ON page_texts BEGIN
+        DELETE FROM page_text_search WHERE rowid = old.rowid;
+        INSERT INTO page_text_search(rowid, text) VALUES (new.rowid, new.text);
+    END;
+    "#,
 ];
 
 /// Schema 1 as shipped in v0.1, for migration tests.

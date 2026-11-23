@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::error::{PortError, ProcessingError};
 use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
+use crate::text::{PageText, TextMatch};
 
 /// Persistence of document and page metadata.
 pub trait DocumentRepository: Send + Sync {
@@ -65,6 +66,22 @@ pub trait DocumentRepository: Send + Sync {
     /// Every stored file the database points to: the original and the
     /// processed image (if any) of every page, relative to the storage root.
     fn referenced_files(&self) -> Result<Vec<PathBuf>, PortError>;
+
+    /// Stores the recognized text of a page, replacing any previous one, and
+    /// indexes `plain_text` for search, atomically.
+    fn save_page_text(&self, text: &PageText, plain_text: &str) -> Result<(), PortError>;
+
+    /// The stored text of a page, current or not.
+    fn get_page_text(&self, page_id: PageId) -> Result<Option<PageText>, PortError>;
+
+    /// Up to `limit` pages with no current text (none stored, or recognized
+    /// in an image the page no longer shows), most recently added first.
+    fn pages_without_text(&self, limit: u32) -> Result<Vec<Page>, PortError>;
+
+    /// Pages whose current text matches every word of `query` (each word
+    /// also matches as a prefix; case and accents are ignored), best match
+    /// first. `query` is user input, not search syntax.
+    fn search_text(&self, query: &str, limit: u32) -> Result<Vec<TextMatch>, PortError>;
 }
 
 /// What a cleanup of unreferenced files removed.
