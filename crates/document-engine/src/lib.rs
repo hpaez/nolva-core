@@ -16,8 +16,8 @@ pub use clock::{Clock, SystemClock};
 pub use error::{DocumentError, PortError, ProcessingError};
 pub use model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
 pub use ports::{
-    CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, ExportSummary,
-    PageFileStore, PageProcessor, PaperSize, PdfExportOptions,
+    CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, ExportPage,
+    ExportSummary, PageFileStore, PageProcessor, PaperSize, PdfExportOptions,
 };
 pub use service::{DocumentService, MAX_SEARCH_RESULTS, MAX_TITLE_CHARS, ORPHAN_GRACE};
 pub use text::{
