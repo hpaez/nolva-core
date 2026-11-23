@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use image::codecs::jpeg::JpegEncoder;
 use image::{GrayImage, Luma, Rgb, RgbImage};
 use lopdf::{Document, Object, ObjectId};
-use pdf_engine::{PageSize, PdfError, PdfOptions, write_pdf};
+use pdf_engine::{PageSize, PdfError, PdfOptions, PdfPage, TextBox, write_pdf};
 
 fn write_jpeg(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
     let path = dir.join(name);
@@ -55,6 +55,17 @@ fn media_box(doc: &Document, page: ObjectId) -> (f32, f32) {
     (num(&rect[2]), num(&rect[3]))
 }
 
+/// Pages with just an image, no text.
+fn image_pages(images: &[PathBuf]) -> Vec<PdfPage> {
+    images
+        .iter()
+        .map(|image| PdfPage {
+            image: image.clone(),
+            text: Vec::new(),
+        })
+        .collect()
+}
+
 /// (width, height, filter) of each page's image, in page order.
 fn page_images(doc: &Document) -> Vec<(i64, i64, String)> {
     doc.get_pages()
@@ -82,7 +93,13 @@ fn writes_one_page_per_image_in_order() {
     ];
     let output = dir.path().join("out.pdf");
 
-    let summary = write_pdf("Contrato", &images, &PdfOptions::default(), &output).unwrap();
+    let summary = write_pdf(
+        "Contrato",
+        &image_pages(&images),
+        &PdfOptions::default(),
+        &output,
+    )
+    .unwrap();
 
     assert_eq!(summary.page_count, 3);
     assert_eq!(summary.size_bytes, fs::metadata(&output).unwrap().len());
@@ -111,7 +128,7 @@ fn embeds_upright_jpegs_without_recompressing() {
 
     write_pdf(
         "x",
-        std::slice::from_ref(&jpeg),
+        &image_pages(std::slice::from_ref(&jpeg)),
         &PdfOptions::default(),
         &output,
     )
@@ -135,7 +152,7 @@ fn applies_exif_rotation_because_pdf_viewers_ignore_it() {
     let photo = write_rotated_jpeg(dir.path(), 400, 200);
     let output = dir.path().join("out.pdf");
 
-    write_pdf("x", &[photo], &PdfOptions::default(), &output).unwrap();
+    write_pdf("x", &image_pages(&[photo]), &PdfOptions::default(), &output).unwrap();
 
     let doc = Document::load(&output).unwrap();
     assert_eq!(page_images(&doc), vec![(200, 400, "DCTDecode".to_string())]);
@@ -153,7 +170,7 @@ fn converts_png_and_keeps_grayscale() {
         .unwrap();
     let output = dir.path().join("out.pdf");
 
-    write_pdf("x", &[png], &PdfOptions::default(), &output).unwrap();
+    write_pdf("x", &image_pages(&[png]), &PdfOptions::default(), &output).unwrap();
 
     let doc = Document::load(&output).unwrap();
     let page = *doc.get_pages().values().next().unwrap();
@@ -172,7 +189,7 @@ fn fit_image_pages_follow_the_image_shape() {
         margin_mm: 0.0,
     };
 
-    write_pdf("x", &[receipt], &options, &output).unwrap();
+    write_pdf("x", &image_pages(&[receipt]), &options, &output).unwrap();
 
     let doc = Document::load(&output).unwrap();
     let page = *doc.get_pages().values().next().unwrap();
@@ -186,7 +203,7 @@ fn sets_the_document_title() {
     let output = dir.path().join("out.pdf");
     write_pdf(
         "Factura de luz",
-        &[write_jpeg(dir.path(), "a.jpg", 10, 10)],
+        &image_pages(&[write_jpeg(dir.path(), "a.jpg", 10, 10)]),
         &PdfOptions::default(),
         &output,
     )
@@ -209,6 +226,77 @@ fn rejects_empty_documents_and_leaves_no_partial_file() {
     ));
 
     let missing = dir.path().join("missing.jpg");
-    assert!(write_pdf("x", &[missing], &PdfOptions::default(), &output).is_err());
+    assert!(
+        write_pdf(
+            "x",
+            &image_pages(&[missing]),
+            &PdfOptions::default(),
+            &output
+        )
+        .is_err()
+    );
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn recognized_text_is_an_invisible_selectable_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    let line = |text: &str, top: f32| TextBox {
+        text: text.into(),
+        left: 0.1,
+        top,
+        right: 0.9,
+        bottom: top + 0.05,
+    };
+    let pages = vec![
+        PdfPage {
+            image: write_jpeg(dir.path(), "a.jpg", 600, 800),
+            text: vec![line("Factura electrónica", 0.1), line("Total: $5.990", 0.2)],
+        },
+        PdfPage {
+            image: write_jpeg(dir.path(), "b.jpg", 600, 800),
+            text: Vec::new(),
+        },
+    ];
+
+    write_pdf("Factura", &pages, &PdfOptions::default(), &output).unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let text = doc.extract_text(&[1]).unwrap();
+    assert!(text.contains("Factura electrónica"), "{text:?}");
+    assert!(text.contains("Total: $5.990"), "{text:?}");
+    assert!(doc.extract_text(&[2]).unwrap().trim().is_empty());
+
+    let ids: Vec<_> = doc.get_pages().values().copied().collect();
+    let content = String::from_utf8_lossy(&doc.get_page_content(ids[0])).into_owned();
+    assert!(
+        content.contains("3 Tr"),
+        "text must be invisible: {content}"
+    );
+    assert_eq!(doc.get_page_fonts(ids[0]).unwrap().len(), 1);
+    assert!(doc.get_page_fonts(ids[1]).unwrap().is_empty());
+    // The scan itself is untouched.
+    assert_eq!(page_images(&doc).len(), 2);
+}
+
+#[test]
+fn pdfs_without_text_have_no_font() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    let pages = image_pages(&[write_jpeg(dir.path(), "a.jpg", 60, 80)]);
+
+    write_pdf("x", &pages, &PdfOptions::default(), &output).unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let has_font = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .any(|d| {
+            d.get(b"Type")
+                .and_then(|t| t.as_name())
+                .is_ok_and(|n| n == b"Font")
+        });
+    assert!(!has_font);
 }

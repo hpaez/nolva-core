@@ -1,4 +1,5 @@
-//! PDF generation: one page per image, in order.
+//! PDF generation: one page per image, in order, optionally with the
+//! page's recognized text as an invisible, selectable layer (see [`TextBox`]).
 //!
 //! JPEGs that are already upright are embedded byte for byte (PDF supports
 //! JPEG natively via `DCTDecode`), so exporting never loses quality and is
@@ -8,6 +9,7 @@
 
 mod embed;
 mod layout;
+mod text;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -16,6 +18,15 @@ use std::path::{Path, PathBuf};
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, TextStr};
 
 pub use layout::{PageSize, PdfOptions};
+pub use text::TextBox;
+
+/// One PDF page: an image and the text recognized in it, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfPage {
+    pub image: PathBuf,
+    /// Lines in reading order, with boxes relative to the upright image.
+    pub text: Vec<TextBox>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PdfError {
@@ -43,18 +54,18 @@ pub struct PdfSummary {
     pub size_bytes: u64,
 }
 
-/// Writes a PDF with one page per image to `output`, atomically.
+/// Writes a PDF with one page per [`PdfPage`] to `output`, atomically.
 pub fn write_pdf(
     title: &str,
-    images: &[PathBuf],
+    pages: &[PdfPage],
     options: &PdfOptions,
     output: &Path,
 ) -> Result<PdfSummary, PdfError> {
-    if images.is_empty() {
+    if pages.is_empty() {
         return Err(PdfError::NoPages);
     }
 
-    let bytes = build_pdf(title, images, options)?;
+    let bytes = build_pdf(title, pages, options)?;
 
     let partial = output.with_extension("pdf.partial");
     let result = (|| {
@@ -72,12 +83,12 @@ pub fn write_pdf(
     }
 
     Ok(PdfSummary {
-        page_count: images.len() as u32,
+        page_count: pages.len() as u32,
         size_bytes: bytes.len() as u64,
     })
 }
 
-fn build_pdf(title: &str, images: &[PathBuf], options: &PdfOptions) -> Result<Vec<u8>, PdfError> {
+fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec<u8>, PdfError> {
     let mut pdf = Pdf::new();
     let mut next_id = Ref::new(1);
     let mut alloc = || next_id.bump();
@@ -86,7 +97,7 @@ fn build_pdf(title: &str, images: &[PathBuf], options: &PdfOptions) -> Result<Ve
     let tree_id = alloc();
     let info_id = alloc();
 
-    let page_ids: Vec<Ref> = images.iter().map(|_| alloc()).collect();
+    let page_ids: Vec<Ref> = pages.iter().map(|_| alloc()).collect();
     pdf.catalog(catalog_id).pages(tree_id);
     pdf.pages(tree_id)
         .kids(page_ids.iter().copied())
@@ -95,8 +106,25 @@ fn build_pdf(title: &str, images: &[PathBuf], options: &PdfOptions) -> Result<Ve
         .title(TextStr(title))
         .producer(TextStr("Nolva"));
 
+    // One font for every page's text layer, written only if some page has text.
+    let has_text = pages.iter().any(|p| !p.text.is_empty());
+    let font_id = alloc();
+    if has_text {
+        let mut font = pdf.type1_font(font_id);
+        font.base_font(Name(b"Helvetica"));
+        font.encoding_predefined(Name(b"WinAnsiEncoding"));
+        font.first_char(text::FIRST_CHAR);
+        font.last_char(text::LAST_CHAR);
+        font.widths(std::iter::repeat_n(
+            text::GLYPH_WIDTH,
+            usize::from(text::LAST_CHAR - text::FIRST_CHAR) + 1,
+        ));
+        font.finish();
+    }
+
     let image_name = Name(b"Im0");
-    for (path, &page_id) in images.iter().zip(&page_ids) {
+    for (source, &page_id) in pages.iter().zip(&page_ids) {
+        let path = &source.image;
         let embedded = embed::prepare(path)?;
         let (page_w, page_h, placement) = layout::place(options, embedded.width, embedded.height);
 
@@ -128,13 +156,19 @@ fn build_pdf(title: &str, images: &[PathBuf], options: &PdfOptions) -> Result<Ve
         ]);
         content.x_object(image_name);
         content.restore_state();
+        text::draw(&mut content, &source.text, &placement);
         pdf.stream(content_id, &content.finish());
 
         let mut page = pdf.page(page_id);
         page.media_box(Rect::new(0.0, 0.0, page_w, page_h));
         page.parent(tree_id);
         page.contents(content_id);
-        page.resources().x_objects().pair(image_name, image_id);
+        let mut resources = page.resources();
+        resources.x_objects().pair(image_name, image_id);
+        if !source.text.is_empty() {
+            resources.fonts().pair(text::FONT_NAME, font_id);
+        }
+        resources.finish();
         page.finish();
     }
 

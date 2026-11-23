@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::error::{PortError, ProcessingError};
 use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
-use crate::text::{PageText, TextMatch};
+use crate::text::{PageText, TextLine, TextMatch};
 
 /// Persistence of document and page metadata.
 pub trait DocumentRepository: Send + Sync {
@@ -180,13 +180,23 @@ pub struct ExportSummary {
     pub size_bytes: u64,
 }
 
+/// One page to export: its displayed image and, if already recognized, its
+/// text, with bounds relative to that image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportPage {
+    /// Absolute path of the image.
+    pub image: PathBuf,
+    pub text: Vec<TextLine>,
+}
+
 /// Turns page images into shareable files.
 pub trait DocumentExporter: Send + Sync {
-    /// Writes a PDF with one page per image, in order, to `output` (atomically).
+    /// Writes a PDF with one page per [`ExportPage`], in order, to `output`
+    /// (atomically). Page text becomes an invisible, selectable layer.
     fn export_pdf(
         &self,
         title: &str,
-        images: &[PathBuf],
+        pages: &[ExportPage],
         options: &PdfExportOptions,
         output: &Path,
     ) -> Result<ExportSummary, ProcessingError>;

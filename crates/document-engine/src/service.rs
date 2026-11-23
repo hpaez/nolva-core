@@ -6,8 +6,8 @@ use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
 use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
 use crate::ports::{
-    CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, ExportSummary,
-    PageFileStore, PageProcessor, PdfExportOptions,
+    CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, ExportPage,
+    ExportSummary, PageFileStore, PageProcessor, PdfExportOptions,
 };
 use crate::text::{PageText, TextLine, TextMatch, normalize_lines};
 
@@ -306,6 +306,8 @@ where
 
     /// Exports the document as a PDF at `output`, one page per page, using
     /// each page's processed image when it has one and the original otherwise.
+    /// Pages whose text is already recognized get it as a selectable layer;
+    /// the others are exported as plain images.
     pub fn export_pdf(
         &self,
         document_id: DocumentId,
@@ -320,16 +322,26 @@ where
         if pages.is_empty() {
             return Err(DocumentError::EmptyDocument(document_id));
         }
-        let images: Vec<_> = pages
-            .iter()
-            .map(|p| {
-                self.files
-                    .resolve(p.processed_path.as_ref().unwrap_or(&p.original_path))
+        let pages = pages
+            .into_iter()
+            .map(|page| {
+                let image = displayed_image(&page);
+                // Only text recognized in this very image lines up with it.
+                let text = self
+                    .repository
+                    .get_page_text(page.id)?
+                    .filter(|t| t.source_path == image)
+                    .map(|t| t.lines)
+                    .unwrap_or_default();
+                Ok(ExportPage {
+                    image: self.files.resolve(&image),
+                    text,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, DocumentError>>()?;
 
         self.exporter
-            .export_pdf(&document.title, &images, options, output)
+            .export_pdf(&document.title, &pages, options, output)
             .map_err(|error| match error {
                 ProcessingError::UnsupportedFormat => DocumentError::UnsupportedImageFormat {
                     extension: "page image".into(),
@@ -684,23 +696,23 @@ mod tests {
     /// Records what it was asked to export.
     #[derive(Default)]
     struct FakeExporter {
-        exported: Mutex<Vec<(String, Vec<PathBuf>)>>,
+        exported: Mutex<Vec<(String, Vec<ExportPage>)>>,
     }
 
     impl DocumentExporter for FakeExporter {
         fn export_pdf(
             &self,
             title: &str,
-            images: &[PathBuf],
+            pages: &[ExportPage],
             _options: &PdfExportOptions,
             _output: &Path,
         ) -> Result<ExportSummary, ProcessingError> {
             self.exported
                 .lock()
                 .unwrap()
-                .push((title.to_owned(), images.to_vec()));
+                .push((title.to_owned(), pages.to_vec()));
             Ok(ExportSummary {
-                page_count: images.len() as u32,
+                page_count: pages.len() as u32,
                 size_bytes: 1,
             })
         }
@@ -956,12 +968,40 @@ mod tests {
 
         assert_eq!(summary.page_count, 2);
         let exported = svc.exporter.exported.lock().unwrap();
-        let (title, images) = &exported[0];
+        let (title, pages) = &exported[0];
         assert_eq!(title, "Contrato");
+        let images: Vec<_> = pages.iter().map(|p| p.image.clone()).collect();
         assert_eq!(
             images,
-            &vec![cropped.processed_path.unwrap(), plain.original_path]
+            vec![cropped.processed_path.unwrap(), plain.original_path]
         );
+    }
+
+    #[test]
+    fn export_includes_only_current_text() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Boletas").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let read = svc.add_page(doc.id, &img).unwrap();
+        let outdated = svc.add_page(doc.id, &img).unwrap();
+        let pending = svc.add_page(doc.id, &img).unwrap();
+        for page in [&read, &outdated] {
+            let image = svc.files().resolve(&page.original_path);
+            svc.save_page_text(page.id, &image, vec![text_line(0, "Total")])
+                .unwrap();
+        }
+        svc.crop_page(outdated.id, crop()).unwrap();
+        let _ = pending;
+
+        svc.export_pdf(doc.id, Path::new("/out.pdf"), &PDF).unwrap();
+
+        let exported = svc.exporter.exported.lock().unwrap();
+        let texts: Vec<Vec<&str>> = exported[0]
+            .1
+            .iter()
+            .map(|p| p.text.iter().map(|l| l.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec![vec!["Total"], vec![], vec![]]);
     }
 
     #[test]

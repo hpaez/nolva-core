@@ -3,16 +3,14 @@
 
 use std::path::Path;
 
-use std::path::PathBuf;
-
 use document_engine::{
-    CornerDetection, Crop, DocumentExporter, ExportSummary, PageFilter, PageProcessor, PaperSize,
-    PdfExportOptions, PortError, ProcessingError,
+    CornerDetection, Crop, DocumentExporter, ExportPage, ExportSummary, PageFilter, PageProcessor,
+    PaperSize, PdfExportOptions, PortError, ProcessingError,
 };
 use image_engine::{
     Filter, ImageError, apply_filter, correct_perspective, load_oriented, save_jpeg,
 };
-use pdf_engine::{PageSize, PdfError, PdfOptions, write_pdf};
+use pdf_engine::{PageSize, PdfError, PdfOptions, PdfPage, TextBox, write_pdf};
 use scanner_engine::{Point, Quad, detect_document};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -85,7 +83,7 @@ impl DocumentExporter for PdfDocumentExporter {
     fn export_pdf(
         &self,
         title: &str,
-        images: &[PathBuf],
+        pages: &[ExportPage],
         options: &PdfExportOptions,
         output: &Path,
     ) -> Result<ExportSummary, ProcessingError> {
@@ -98,7 +96,24 @@ impl DocumentExporter for PdfDocumentExporter {
             },
             margin_mm: options.margin_mm,
         };
-        let summary = write_pdf(title, images, &options, output).map_err(|e| match e {
+        let pages: Vec<PdfPage> = pages
+            .iter()
+            .map(|page| PdfPage {
+                image: page.image.clone(),
+                text: page
+                    .text
+                    .iter()
+                    .map(|line| TextBox {
+                        text: line.text.clone(),
+                        left: line.bounds.left,
+                        top: line.bounds.top,
+                        right: line.bounds.right,
+                        bottom: line.bounds.bottom,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let summary = write_pdf(title, &pages, &options, output).map_err(|e| match e {
             PdfError::UnsupportedFormat(_) => ProcessingError::UnsupportedFormat,
             other => ProcessingError::Failed(PortError::new("export pdf", other)),
         })?;
