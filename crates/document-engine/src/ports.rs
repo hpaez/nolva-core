@@ -12,8 +12,22 @@ pub trait DocumentRepository: Send + Sync {
 
     fn get_document(&self, id: DocumentId) -> Result<Option<Document>, PortError>;
 
-    /// All documents, most recently updated first.
+    /// Documents not in the trash, most recently updated first.
     fn list_documents(&self) -> Result<Vec<Document>, PortError>;
+
+    /// Documents in the trash, most recently trashed first.
+    fn list_trashed_documents(&self) -> Result<Vec<Document>, PortError>;
+
+    /// Moves a document to the trash (`Some(when)`) or takes it out
+    /// (`None`). Returns whether it exists.
+    fn set_document_trashed(
+        &self,
+        id: DocumentId,
+        trashed_at_ms: Option<i64>,
+    ) -> Result<bool, PortError>;
+
+    /// Documents trashed before `cutoff_ms`.
+    fn trashed_before(&self, cutoff_ms: i64) -> Result<Vec<DocumentId>, PortError>;
 
     /// Appends a page at the end of its document and bumps the document's
     /// `updated_at_ms`, atomically. The repository assigns the position, so
@@ -76,11 +90,13 @@ pub trait DocumentRepository: Send + Sync {
 
     /// Up to `limit` pages with no current text (none stored, or recognized
     /// in an image the page no longer shows), most recently added first.
+    /// Pages of trashed documents are left out.
     fn pages_without_text(&self, limit: u32) -> Result<Vec<Page>, PortError>;
 
     /// Pages whose current text matches every word of `query` (each word
     /// also matches as a prefix; case and accents are ignored), best match
-    /// first. `query` is user input, not search syntax.
+    /// first. `query` is user input, not search syntax. Trashed documents
+    /// are left out.
     fn search_text(&self, query: &str, limit: u32) -> Result<Vec<TextMatch>, PortError>;
 }
 
@@ -107,6 +123,10 @@ pub trait PageFileStore: Send + Sync {
     /// processed image of the page. Unique so a new crop never overwrites
     /// the file the database still points to.
     fn new_processed_path(&self, document_id: DocumentId, page_id: PageId) -> PathBuf;
+
+    /// Copies stored file `from` to `to` (both relative to the storage
+    /// root), atomically, creating `to`'s folder if needed.
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), PortError>;
 
     /// Removes a single stored file. Missing files are not an error.
     fn remove_file(&self, relative: &Path) -> Result<(), PortError>;

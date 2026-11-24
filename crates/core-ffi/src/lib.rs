@@ -93,6 +93,8 @@ pub struct DocumentInfo {
     /// Absolute path of the first page's image (processed if it has one),
     /// for thumbnails. `None` while the document has no pages.
     pub cover_path: Option<String>,
+    /// When it was moved to the trash; `None` while it isn't.
+    pub trashed_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -357,6 +359,52 @@ impl NolvaCore {
         Ok(self.document_info(self.service.rename_document(id, &title)?))
     }
 
+    /// Moves a document to the trash. It leaves `list_documents`, search
+    /// and text recognition, and is deleted for good after 30 days unless
+    /// restored.
+    pub fn move_document_to_trash(&self, document_id: String) -> Result<(), NolvaError> {
+        let id: DocumentId = document_id.parse()?;
+        Ok(self.service.move_to_trash(id)?)
+    }
+
+    /// Takes a document out of the trash, as it was.
+    pub fn restore_document(&self, document_id: String) -> Result<DocumentInfo, NolvaError> {
+        let id: DocumentId = document_id.parse()?;
+        Ok(self.document_info(self.service.restore_from_trash(id)?))
+    }
+
+    /// Documents in the trash, most recently trashed first.
+    pub fn list_trashed_documents(&self) -> Result<Vec<DocumentInfo>, NolvaError> {
+        Ok(self
+            .service
+            .list_trash()?
+            .into_iter()
+            .map(|d| self.document_info(d))
+            .collect())
+    }
+
+    /// Permanently deletes every trashed document. Returns how many.
+    pub fn empty_trash(&self) -> Result<u32, NolvaError> {
+        Ok(self.service.empty_trash()?)
+    }
+
+    /// Permanently deletes documents trashed more than 30 days ago. Returns
+    /// how many. Run it with the other maintenance, e.g. once per app start.
+    pub fn purge_expired_trash(&self) -> Result<u32, NolvaError> {
+        Ok(self.service.purge_expired_trash()?)
+    }
+
+    /// Copies a document, with its pages, crops, filters and recognized
+    /// text, under `title` (the app supplies it, e.g. "Contrato (copia)").
+    pub fn duplicate_document(
+        &self,
+        document_id: String,
+        title: String,
+    ) -> Result<DocumentInfo, NolvaError> {
+        let id: DocumentId = document_id.parse()?;
+        Ok(self.document_info(self.service.duplicate_document(id, &title)?))
+    }
+
     /// Permanently deletes a document, its pages and all their images.
     pub fn delete_document(&self, document_id: String) -> Result<(), NolvaError> {
         let id: DocumentId = document_id.parse()?;
@@ -598,6 +646,7 @@ impl NolvaCore {
             cover_path: d
                 .cover_path
                 .map(|p| files.resolve(&p).to_string_lossy().into_owned()),
+            trashed_at_ms: d.trashed_at_ms,
         }
     }
 
@@ -748,6 +797,50 @@ mod tests {
             (doc.id.as_str(), page.id.as_str())
         );
         assert!(core.search_text("  ".into()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trash_and_duplicate_round_trip() {
+        let data = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let img = src_dir.path().join("shot.png");
+        std::fs::write(&img, b"png").unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Arriendo".into()).unwrap();
+        core.add_page(doc.id.clone(), img.to_string_lossy().into_owned())
+            .unwrap();
+
+        let copy = core
+            .duplicate_document(doc.id.clone(), "Arriendo (copia)".into())
+            .unwrap();
+        assert_eq!(
+            (copy.title.as_str(), copy.page_count),
+            ("Arriendo (copia)", 1)
+        );
+        assert_ne!(copy.cover_path, doc.cover_path);
+
+        core.move_document_to_trash(doc.id.clone()).unwrap();
+        let listed: Vec<_> = core
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(listed, vec![copy.id.clone()]);
+        let trash = core.list_trashed_documents().unwrap();
+        assert_eq!(trash[0].id, doc.id);
+        assert!(trash[0].trashed_at_ms.is_some());
+        assert_eq!(
+            core.purge_expired_trash().unwrap(),
+            0,
+            "not 30 days old yet"
+        );
+
+        let restored = core.restore_document(doc.id.clone()).unwrap();
+        assert_eq!(restored.trashed_at_ms, None);
+        core.move_document_to_trash(doc.id).unwrap();
+        assert_eq!(core.empty_trash().unwrap(), 1);
+        assert!(core.list_trashed_documents().unwrap().is_empty());
     }
 
     #[test]

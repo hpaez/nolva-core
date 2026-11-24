@@ -116,6 +116,23 @@ impl PageFileStore for LocalPageFileStore {
             .join(format!("processed-{}.jpg", uuid::Uuid::new_v4().simple()))
     }
 
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), PortError> {
+        let source = self.root.join(from);
+        let target = self.root.join(to);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| PortError::new("create folder", e))?;
+        }
+        let partial = target.with_extension("partial");
+        let result = fs::copy(&source, &partial)
+            .and_then(|_| fs::File::open(&partial)?.sync_all())
+            .and_then(|()| fs::rename(&partial, &target));
+        if let Err(e) = result {
+            let _ = fs::remove_file(&partial);
+            return Err(PortError::new("copy file", e));
+        }
+        Ok(())
+    }
+
     fn remove_file(&self, relative: &Path) -> Result<(), PortError> {
         match fs::remove_file(self.root.join(relative)) {
             Ok(()) => Ok(()),
@@ -335,5 +352,27 @@ mod tests {
         let store = LocalPageFileStore::new(root.path()).unwrap();
         let summary = store.remove_unreferenced(&HashSet::new(), HOUR).unwrap();
         assert_eq!(summary, CleanupSummary::default());
+    }
+
+    #[test]
+    fn copies_files_into_new_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalPageFileStore::new(root.path()).unwrap();
+        let (d, p) = (DocumentId::new(), PageId::new());
+        let from = store.new_processed_path(d, p);
+        fs::create_dir_all(store.resolve(&from).parent().unwrap()).unwrap();
+        fs::write(store.resolve(&from), b"jpeg").unwrap();
+
+        let to = store.new_processed_path(DocumentId::new(), PageId::new());
+        store.copy_file(&from, &to).unwrap();
+
+        assert_eq!(fs::read(store.resolve(&to)).unwrap(), b"jpeg");
+        assert!(store.resolve(&from).exists());
+        let missing = store.new_processed_path(d, PageId::new());
+        assert!(
+            store
+                .copy_file(&missing, &store.new_processed_path(d, p))
+                .is_err()
+        );
     }
 }

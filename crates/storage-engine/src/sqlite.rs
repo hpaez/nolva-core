@@ -64,7 +64,8 @@ impl SqliteDocumentRepository {
 const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.created_at_ms, d.updated_at_ms, \
      (SELECT COUNT(*) FROM pages p WHERE p.document_id = d.id), \
      (SELECT COALESCE(p.processed_path, p.original_path) FROM pages p \
-      WHERE p.document_id = d.id ORDER BY p.position LIMIT 1)";
+      WHERE p.document_id = d.id ORDER BY p.position LIMIT 1), \
+     d.trashed_at_ms";
 
 fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
     Ok(Document {
@@ -74,6 +75,7 @@ fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
         updated_at_ms: row.get(3)?,
         page_count: row.get(4)?,
         cover_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+        trashed_at_ms: row.get(6)?,
     })
 }
 
@@ -251,12 +253,54 @@ impl DocumentRepository for SqliteDocumentRepository {
         let mut stmt = conn
             .prepare_cached(&format!(
                 "SELECT {DOCUMENT_COLUMNS} FROM documents d
+                 WHERE d.trashed_at_ms IS NULL
                  ORDER BY d.updated_at_ms DESC, d.id"
             ))
             .map_err(|e| PortError::new("list documents", e))?;
         stmt.query_map([], document_from_row)
             .and_then(Iterator::collect)
             .map_err(|e| PortError::new("list documents", e))
+    }
+
+    fn list_trashed_documents(&self) -> Result<Vec<Document>, PortError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(&format!(
+                "SELECT {DOCUMENT_COLUMNS} FROM documents d
+                 WHERE d.trashed_at_ms IS NOT NULL
+                 ORDER BY d.trashed_at_ms DESC, d.id"
+            ))
+            .map_err(|e| PortError::new("list trashed documents", e))?;
+        stmt.query_map([], document_from_row)
+            .and_then(Iterator::collect)
+            .map_err(|e| PortError::new("list trashed documents", e))
+    }
+
+    fn set_document_trashed(
+        &self,
+        id: DocumentId,
+        trashed_at_ms: Option<i64>,
+    ) -> Result<bool, PortError> {
+        // Not an edit of the document: updated_at_ms stays, so a restored
+        // document goes back to its place in the list.
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE documents SET trashed_at_ms = ?2 WHERE id = ?1",
+                params![id.to_string(), trashed_at_ms],
+            )
+            .map_err(|e| PortError::new("trash document", e))?;
+        Ok(changed > 0)
+    }
+
+    fn trashed_before(&self, cutoff_ms: i64) -> Result<Vec<DocumentId>, PortError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached("SELECT id FROM documents WHERE trashed_at_ms < ?1")
+            .map_err(|e| PortError::new("list expired trash", e))?;
+        stmt.query_map(params![cutoff_ms], |row| parse_id(row, 0))
+            .and_then(Iterator::collect)
+            .map_err(|e| PortError::new("list expired trash", e))
     }
 
     fn append_page(&self, p: &NewPage) -> Result<Page, PortError> {
@@ -590,6 +634,9 @@ impl DocumentRepository for SqliteDocumentRepository {
                      SELECT 1 FROM page_texts t
                      WHERE t.page_id = pages.id
                        AND t.source_path = COALESCE(pages.processed_path, pages.original_path))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM documents d
+                     WHERE d.id = pages.document_id AND d.trashed_at_ms IS NOT NULL)
                  ORDER BY created_at_ms DESC, id
                  LIMIT ?1"
             ))
@@ -613,8 +660,10 @@ impl DocumentRepository for SqliteDocumentRepository {
                  FROM page_text_search
                  JOIN page_texts t ON t.rowid = page_text_search.rowid
                  JOIN pages p ON p.id = t.page_id
+                 JOIN documents d ON d.id = p.document_id
                  WHERE page_text_search MATCH ?1
                    AND t.source_path = COALESCE(p.processed_path, p.original_path)
+                   AND d.trashed_at_ms IS NULL
                  ORDER BY rank
                  LIMIT ?2",
             )
@@ -645,6 +694,7 @@ mod tests {
             updated_at_ms: updated,
             page_count: 0,
             cover_path: None,
+            trashed_at_ms: None,
         }
     }
 
@@ -988,6 +1038,54 @@ mod tests {
         );
         assert_eq!(fts_query("di\"jo"), Some("\"di\"\"jo\"*".into()));
         assert_eq!(fts_query(" - * "), None);
+    }
+
+    #[test]
+    fn trashed_documents_are_listed_apart_and_hidden_from_search_and_ocr() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let (kept, trashed) = (doc("a", 1), doc("b", 2));
+        repo.insert_document(&kept).unwrap();
+        repo.insert_document(&trashed).unwrap();
+        let page = repo.append_page(&new_page(trashed.id, 3)).unwrap();
+        let path = page.original_path.to_string_lossy().into_owned();
+        save(&repo, &page_text(&page, &path, &[(0, "contrato")]));
+        let pending_before = repo.append_page(&new_page(trashed.id, 4)).unwrap();
+        assert_eq!(
+            ids(&repo.pages_without_text(10).unwrap()),
+            vec![pending_before.id]
+        );
+
+        assert!(repo.set_document_trashed(trashed.id, Some(50)).unwrap());
+
+        let listed: Vec<_> = repo
+            .list_documents()
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(listed, vec![kept.id]);
+        let trash = repo.list_trashed_documents().unwrap();
+        assert_eq!(
+            (trash.len(), trash[0].trashed_at_ms, trash[0].page_count),
+            (1, Some(50), 2)
+        );
+        assert!(search(&repo, "contrato").is_empty());
+        assert!(repo.pages_without_text(10).unwrap().is_empty());
+        assert_eq!(repo.trashed_before(51).unwrap(), vec![trashed.id]);
+        assert!(repo.trashed_before(50).unwrap().is_empty());
+
+        assert!(repo.set_document_trashed(trashed.id, None).unwrap());
+        let restored = repo.get_document(trashed.id).unwrap().unwrap();
+        assert_eq!(
+            (restored.trashed_at_ms, restored.updated_at_ms),
+            (None, trashed.updated_at_ms + 2)
+        );
+        assert_eq!(search(&repo, "contrato"), vec![page.id]);
+        assert!(
+            !repo
+                .set_document_trashed(DocumentId::new(), Some(1))
+                .unwrap()
+        );
     }
 
     #[test]

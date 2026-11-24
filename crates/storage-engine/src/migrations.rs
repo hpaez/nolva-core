@@ -76,6 +76,12 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO page_text_search(rowid, text) VALUES (new.rowid, new.text);
     END;
     "#,
+    // 5: trash. NULL while the document isn't trashed.
+    r#"
+    ALTER TABLE documents ADD COLUMN trashed_at_ms INTEGER;
+    CREATE INDEX documents_trashed_idx ON documents(trashed_at_ms)
+        WHERE trashed_at_ms IS NOT NULL;
+    "#,
 ];
 
 /// Schema 1 as shipped in v0.1, for migration tests.

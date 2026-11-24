@@ -19,7 +19,10 @@ pub use ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
     ExportPage, ExportSummary, PageFileStore, PageProcessor, PaperSize, PdfExportOptions,
 };
-pub use service::{DocumentService, DocxExport, MAX_SEARCH_RESULTS, MAX_TITLE_CHARS, ORPHAN_GRACE};
+pub use service::{
+    DocumentService, DocxExport, MAX_SEARCH_RESULTS, MAX_TITLE_CHARS, ORPHAN_GRACE,
+    TRASH_RETENTION_MS,
+};
 pub use text::{
     MAX_LINES_PER_PAGE, MAX_TEXT_CHARS_PER_PAGE, PageText, TextBounds, TextLine, TextMatch,
 };

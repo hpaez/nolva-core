@@ -64,6 +64,8 @@ pub struct Document {
     /// storage root, for list thumbnails. `None` for empty documents. Derived
     /// by the repository on read; ignored on insert.
     pub cover_path: Option<PathBuf>,
+    /// When the document was moved to the trash; `None` while it isn't.
+    pub trashed_at_ms: Option<i64>,
 }
 
 /// Page outline chosen for cropping: four corners in normalized coordinates
