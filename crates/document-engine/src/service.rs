@@ -14,6 +14,9 @@ use crate::text::{PageText, TextLine, TextMatch, normalize_lines};
 /// Maximum length of a document title, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
 
+/// Documents stay in the trash this long before they are deleted for good.
+pub const TRASH_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
 /// Most search results returned.
 pub const MAX_SEARCH_RESULTS: u32 = 50;
 
@@ -64,6 +67,7 @@ where
             updated_at_ms: now,
             page_count: 0,
             cover_path: None,
+            trashed_at_ms: None,
         };
         self.repository.insert_document(&document)?;
         Ok(document)
@@ -153,6 +157,147 @@ where
         // newer than the grace period, so it can't be removed by mistake.
         let referenced: HashSet<_> = self.repository.referenced_files()?.into_iter().collect();
         Ok(self.files.remove_unreferenced(&referenced, ORPHAN_GRACE)?)
+    }
+
+    /// Moves a document to the trash: it leaves the list, search and text
+    /// recognition, and is deleted for good after [`TRASH_RETENTION_MS`]
+    /// unless restored.
+    pub fn move_to_trash(&self, id: DocumentId) -> Result<(), DocumentError> {
+        if !self
+            .repository
+            .set_document_trashed(id, Some(self.clock.now_ms()))?
+        {
+            return Err(DocumentError::DocumentNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Takes a document out of the trash, as it was.
+    pub fn restore_from_trash(&self, id: DocumentId) -> Result<Document, DocumentError> {
+        if !self.repository.set_document_trashed(id, None)? {
+            return Err(DocumentError::DocumentNotFound(id));
+        }
+        self.repository
+            .get_document(id)?
+            .ok_or(DocumentError::DocumentNotFound(id))
+    }
+
+    /// Documents in the trash, most recently trashed first.
+    pub fn list_trash(&self) -> Result<Vec<Document>, DocumentError> {
+        Ok(self.repository.list_trashed_documents()?)
+    }
+
+    /// Deletes every trashed document for good. Returns how many.
+    pub fn empty_trash(&self) -> Result<u32, DocumentError> {
+        let ids: Vec<_> = self.list_trash()?.into_iter().map(|d| d.id).collect();
+        self.delete_all(&ids)
+    }
+
+    /// Deletes documents trashed more than [`TRASH_RETENTION_MS`] ago.
+    /// Returns how many. Meant for periodic maintenance.
+    pub fn purge_expired_trash(&self) -> Result<u32, DocumentError> {
+        let cutoff = self.clock.now_ms() - TRASH_RETENTION_MS;
+        let ids = self.repository.trashed_before(cutoff)?;
+        self.delete_all(&ids)
+    }
+
+    fn delete_all(&self, ids: &[DocumentId]) -> Result<u32, DocumentError> {
+        let mut deleted = 0;
+        for &id in ids {
+            match self.delete_document(id) {
+                Ok(()) => deleted += 1,
+                // Deleted meanwhile: nothing left to do.
+                Err(DocumentError::DocumentNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Copies a document under a new `title`: its pages with their images,
+    /// crops, filters and recognized text. All or nothing: if a copy fails,
+    /// the half-made document is removed.
+    pub fn duplicate_document(
+        &self,
+        id: DocumentId,
+        title: &str,
+    ) -> Result<Document, DocumentError> {
+        let title = normalize_title(title)?;
+        if self.repository.get_document(id)?.is_none() {
+            return Err(DocumentError::DocumentNotFound(id));
+        }
+        let pages = self.repository.list_pages(id)?;
+        let now = self.clock.now_ms();
+        let copy = Document {
+            id: DocumentId::new(),
+            title,
+            created_at_ms: now,
+            updated_at_ms: now,
+            page_count: 0,
+            cover_path: None,
+            trashed_at_ms: None,
+        };
+        self.repository.insert_document(&copy)?;
+
+        let copied = pages
+            .iter()
+            .try_for_each(|page| self.copy_page(copy.id, page));
+        if let Err(error) = copied {
+            let _ = self.repository.delete_document(copy.id);
+            let _ = self.files.remove_document_files(copy.id);
+            return Err(error);
+        }
+        self.repository
+            .get_document(copy.id)?
+            .ok_or(DocumentError::DocumentNotFound(copy.id))
+    }
+
+    /// Appends a copy of `page` (files, rendering and current text) to `document_id`.
+    fn copy_page(&self, document_id: DocumentId, page: &Page) -> Result<(), DocumentError> {
+        let page_id = PageId::new();
+        let format = ImageFormat::from_path(&page.original_path)?;
+        let original = self.files.import_original(
+            document_id,
+            page_id,
+            format,
+            &self.files.resolve(&page.original_path),
+        )?;
+        let now = self.clock.now_ms();
+        let new_page = self.repository.append_page(&NewPage {
+            id: page_id,
+            document_id,
+            original_path: original,
+            created_at_ms: now,
+        })?;
+
+        let processed = match &page.processed_path {
+            Some(source) => {
+                let copy = self.files.new_processed_path(document_id, page_id);
+                self.files.copy_file(source, &copy)?;
+                Some(copy)
+            }
+            None => None,
+        };
+        if page.crop.is_some() || page.filter != PageFilter::Original || processed.is_some() {
+            self.repository.set_page_rendering(
+                page_id,
+                page.crop.as_ref(),
+                page.filter,
+                processed.as_deref(),
+                now,
+            )?;
+        }
+
+        if let Some(text) = self.page_text(page.id)? {
+            let copy = PageText {
+                page_id,
+                source_path: processed.unwrap_or(new_page.original_path),
+                lines: text.lines,
+                recognized_at_ms: text.recognized_at_ms,
+            };
+            self.repository.save_page_text(&copy, &copy.plain_text())?;
+        }
+        Ok(())
     }
 
     /// Deletes a page and its images; later pages move up one position.
@@ -474,7 +619,47 @@ mod tests {
             Ok(self.docs.lock().unwrap().get(&id).cloned())
         }
         fn list_documents(&self) -> Result<Vec<Document>, PortError> {
-            Ok(self.docs.lock().unwrap().values().cloned().collect())
+            Ok(self
+                .docs
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|d| d.trashed_at_ms.is_none())
+                .cloned()
+                .collect())
+        }
+        fn list_trashed_documents(&self) -> Result<Vec<Document>, PortError> {
+            Ok(self
+                .docs
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|d| d.trashed_at_ms.is_some())
+                .cloned()
+                .collect())
+        }
+        fn set_document_trashed(
+            &self,
+            id: DocumentId,
+            trashed_at_ms: Option<i64>,
+        ) -> Result<bool, PortError> {
+            Ok(self
+                .docs
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .map(|d| d.trashed_at_ms = trashed_at_ms)
+                .is_some())
+        }
+        fn trashed_before(&self, cutoff_ms: i64) -> Result<Vec<DocumentId>, PortError> {
+            Ok(self
+                .docs
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|d| d.trashed_at_ms.is_some_and(|t| t < cutoff_ms))
+                .map(|d| d.id)
+                .collect())
         }
         fn append_page(&self, p: &NewPage) -> Result<Page, PortError> {
             if self.fail_append {
@@ -660,6 +845,7 @@ mod tests {
         removed_pages: Mutex<Vec<PageId>>,
         processed: Mutex<HashSet<PathBuf>>,
         counter: Mutex<u32>,
+        fail_copy: Mutex<bool>,
         /// What the last cleanup was asked to keep, and with which grace.
         swept: Mutex<Option<(HashSet<PathBuf>, Duration)>>,
     }
@@ -678,6 +864,13 @@ mod tests {
             let mut counter = self.counter.lock().unwrap();
             *counter += 1;
             PathBuf::from(format!("{d}/{p}/processed-{counter}.jpg"))
+        }
+        fn copy_file(&self, _from: &Path, to: &Path) -> Result<(), PortError> {
+            if *self.fail_copy.lock().unwrap() {
+                return Err(PortError::new("copy_file", "simulated failure"));
+            }
+            self.processed.lock().unwrap().insert(to.to_path_buf());
+            Ok(())
         }
         fn remove_file(&self, relative: &Path) -> Result<(), PortError> {
             self.processed.lock().unwrap().remove(relative);
@@ -1287,5 +1480,104 @@ mod tests {
             svc.repository.searched.lock().unwrap().as_deref(),
             Some("boleta luz")
         );
+    }
+
+    #[test]
+    fn trashed_documents_leave_the_list_until_restored() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Boleta").unwrap();
+        let other = svc.create_document("Otro").unwrap();
+
+        svc.move_to_trash(doc.id).unwrap();
+
+        assert_eq!(ids_of(svc.list_documents().unwrap()), vec![other.id]);
+        let trash = svc.list_trash().unwrap();
+        assert_eq!(ids_of(trash.clone()), vec![doc.id]);
+        assert_eq!(trash[0].trashed_at_ms, Some(1_000));
+
+        let restored = svc.restore_from_trash(doc.id).unwrap();
+        assert_eq!(restored.trashed_at_ms, None);
+        assert!(svc.list_trash().unwrap().is_empty());
+        assert!(matches!(
+            svc.move_to_trash(DocumentId::new()),
+            Err(DocumentError::DocumentNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn emptying_and_expiry_delete_for_good() {
+        let svc = service(InMemoryRepo::default());
+        let old = svc.create_document("Viejo").unwrap();
+        let recent = svc.create_document("Reciente").unwrap();
+        let kept = svc.create_document("Activo").unwrap();
+        svc.repository
+            .set_document_trashed(old.id, Some(1_000 - TRASH_RETENTION_MS - 1))
+            .unwrap();
+        svc.move_to_trash(recent.id).unwrap();
+
+        assert_eq!(svc.purge_expired_trash().unwrap(), 1);
+        assert_eq!(ids_of(svc.list_trash().unwrap()), vec![recent.id]);
+        assert_eq!(*svc.files().removed_documents.lock().unwrap(), vec![old.id]);
+
+        assert_eq!(svc.empty_trash().unwrap(), 1);
+        assert!(svc.list_trash().unwrap().is_empty());
+        assert_eq!(ids_of(svc.list_documents().unwrap()), vec![kept.id]);
+    }
+
+    #[test]
+    fn duplicates_copy_pages_rendering_and_text() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Contrato").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let plain = svc.add_page(doc.id, &img).unwrap();
+        let cropped = svc.add_page(doc.id, &img).unwrap();
+        let cropped = svc.crop_page(cropped.id, crop()).unwrap();
+        let image = svc
+            .files()
+            .resolve(cropped.processed_path.as_ref().unwrap());
+        svc.save_page_text(cropped.id, &image, vec![text_line(0, "Firma")])
+            .unwrap();
+
+        let copy = svc
+            .duplicate_document(doc.id, " Contrato (copia) ")
+            .unwrap();
+
+        assert_eq!(copy.title, "Contrato (copia)");
+        assert_ne!(copy.id, doc.id);
+        let pages = svc.list_pages(copy.id).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().all(|p| p.id != plain.id && p.id != cropped.id));
+        assert_eq!(pages[0].processed_path, None);
+        assert_eq!(pages[1].crop, cropped.crop);
+        let copied = pages[1].processed_path.clone().unwrap();
+        assert_ne!(Some(copied.clone()), cropped.processed_path, "own file");
+        assert!(svc.files().processed.lock().unwrap().contains(&copied));
+        let text = svc.page_text(pages[1].id).unwrap().unwrap();
+        assert_eq!(text.plain_text(), "Firma");
+        assert_eq!(svc.page_text(pages[0].id).unwrap(), None);
+        // The original is untouched.
+        assert_eq!(svc.list_pages(doc.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_duplicates_leave_nothing_behind() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Contrato").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        svc.crop_page(page.id, crop()).unwrap();
+        *svc.files().fail_copy.lock().unwrap() = true;
+
+        assert!(svc.duplicate_document(doc.id, "Copia").is_err());
+
+        assert_eq!(ids_of(svc.list_documents().unwrap()), vec![doc.id]);
+        assert!(matches!(
+            svc.duplicate_document(doc.id, "   "),
+            Err(DocumentError::InvalidTitle { .. })
+        ));
+    }
+
+    fn ids_of(documents: Vec<Document>) -> Vec<DocumentId> {
+        documents.into_iter().map(|d| d.id).collect()
     }
 }
