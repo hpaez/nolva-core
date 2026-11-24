@@ -237,6 +237,20 @@ pub struct TextSearchHit {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct DocxOptions {
+    /// Append each page's image after the text.
+    pub include_images: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct DocxExportInfo {
+    pub page_count: u32,
+    pub size_bytes: u64,
+    /// Pages exported without text because it wasn't recognized yet.
+    pub pages_pending_text: u32,
+}
+
 /// What [`NolvaCore::remove_orphan_files`] cleaned up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct CleanupInfo {
@@ -502,6 +516,35 @@ impl NolvaCore {
         })
     }
 
+    /// Writes the document as an editable Word file to `output_path`
+    /// (absolute; its folder must exist): the pages' recognized text as
+    /// paragraphs, one Word page per page. Recognize pending pages first
+    /// (see [`Self::pages_needing_text`]); any left are reported in
+    /// `pages_pending_text` and come out empty. Call off the main thread.
+    pub fn export_docx(
+        &self,
+        document_id: String,
+        output_path: String,
+        options: DocxOptions,
+    ) -> Result<DocxExportInfo, NolvaError> {
+        let id: DocumentId = document_id.parse()?;
+        let output = PathBuf::from(output_path);
+        if !output.is_absolute() {
+            return Err(NolvaError::InvalidArgument {
+                reason: "output_path must be absolute".into(),
+            });
+        }
+        let options = document_engine::DocxExportOptions {
+            include_images: options.include_images,
+        };
+        let export = self.service.export_docx(id, &output, &options)?;
+        Ok(DocxExportInfo {
+            page_count: export.summary.page_count,
+            size_bytes: export.summary.size_bytes,
+            pages_pending_text: export.pages_pending_text,
+        })
+    }
+
     pub fn get_page(&self, page_id: String) -> Result<PageInfo, NolvaError> {
         let id: PageId = page_id.parse()?;
         Ok(self.page_info(self.service.get_page(id)?))
@@ -705,6 +748,43 @@ mod tests {
             (doc.id.as_str(), page.id.as_str())
         );
         assert!(core.search_text("  ".into()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exports_word_documents() {
+        let data = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let img = src_dir.path().join("shot.png");
+        image::RgbImage::from_pixel(60, 80, image::Rgb([250, 250, 250]))
+            .save(&img)
+            .unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Carta".into()).unwrap();
+        let first = core
+            .add_page(doc.id.clone(), img.to_string_lossy().into_owned())
+            .unwrap();
+        core.add_page(doc.id.clone(), img.to_string_lossy().into_owned())
+            .unwrap();
+        core.save_page_text(
+            first.id,
+            first.original_path,
+            vec![line(0, "Estimado Hugo:")],
+        )
+        .unwrap();
+
+        let output = src_dir.path().join("Carta.docx");
+        let info = core
+            .export_docx(
+                doc.id,
+                output.to_string_lossy().into_owned(),
+                DocxOptions {
+                    include_images: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!((info.page_count, info.pages_pending_text), (2, 1));
+        assert_eq!(info.size_bytes, std::fs::metadata(&output).unwrap().len());
     }
 
     #[test]

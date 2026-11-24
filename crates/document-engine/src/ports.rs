@@ -174,6 +174,12 @@ pub struct PdfExportOptions {
     pub margin_mm: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DocxExportOptions {
+    /// Append each page's image after the text.
+    pub include_images: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportSummary {
     pub page_count: u32,
@@ -198,6 +204,16 @@ pub trait DocumentExporter: Send + Sync {
         title: &str,
         pages: &[ExportPage],
         options: &PdfExportOptions,
+        output: &Path,
+    ) -> Result<ExportSummary, ProcessingError>;
+
+    /// Writes an editable Word document to `output` (atomically): the pages'
+    /// text rebuilt as paragraphs, one Word page per page.
+    fn export_docx(
+        &self,
+        title: &str,
+        pages: &[ExportPage],
+        options: &DocxExportOptions,
         output: &Path,
     ) -> Result<ExportSummary, ProcessingError>;
 }

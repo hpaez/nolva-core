@@ -4,9 +4,10 @@
 use std::path::Path;
 
 use document_engine::{
-    CornerDetection, Crop, DocumentExporter, ExportPage, ExportSummary, PageFilter, PageProcessor,
-    PaperSize, PdfExportOptions, PortError, ProcessingError,
+    CornerDetection, Crop, DocumentExporter, DocxExportOptions, ExportPage, ExportSummary,
+    PageFilter, PageProcessor, PaperSize, PdfExportOptions, PortError, ProcessingError,
 };
+use docx_engine::{DocxError, DocxLine, DocxOptions, DocxPage, write_docx};
 use image_engine::{
     Filter, ImageError, apply_filter, correct_perspective, load_oriented, save_jpeg,
 };
@@ -116,6 +117,47 @@ impl DocumentExporter for PdfDocumentExporter {
         let summary = write_pdf(title, &pages, &options, output).map_err(|e| match e {
             PdfError::UnsupportedFormat(_) => ProcessingError::UnsupportedFormat,
             other => ProcessingError::Failed(PortError::new("export pdf", other)),
+        })?;
+        Ok(ExportSummary {
+            page_count: summary.page_count,
+            size_bytes: summary.size_bytes,
+        })
+    }
+
+    fn export_docx(
+        &self,
+        title: &str,
+        pages: &[ExportPage],
+        options: &DocxExportOptions,
+        output: &Path,
+    ) -> Result<ExportSummary, ProcessingError> {
+        let pages: Vec<DocxPage> = pages
+            .iter()
+            .map(|page| DocxPage {
+                image: page.image.clone(),
+                lines: page
+                    .text
+                    .iter()
+                    .map(|line| DocxLine {
+                        block: line.block,
+                        text: line.text.clone(),
+                        left: line.bounds.left,
+                        top: line.bounds.top,
+                        right: line.bounds.right,
+                        bottom: line.bounds.bottom,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let options = DocxOptions {
+            include_images: options.include_images,
+        };
+        let summary = write_docx(title, &pages, &options, output).map_err(|e| match e {
+            DocxError::Image {
+                source: ImageError::UnsupportedFormat(_),
+                ..
+            } => ProcessingError::UnsupportedFormat,
+            other => ProcessingError::Failed(PortError::new("export docx", other)),
         })?;
         Ok(ExportSummary {
             page_count: summary.page_count,

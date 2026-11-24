@@ -6,8 +6,8 @@ use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
 use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
 use crate::ports::{
-    CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, ExportPage,
-    ExportSummary, PageFileStore, PageProcessor, PdfExportOptions,
+    CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
+    ExportPage, ExportSummary, PageFileStore, PageProcessor, PdfExportOptions,
 };
 use crate::text::{PageText, TextLine, TextMatch, normalize_lines};
 
@@ -314,6 +314,39 @@ where
         output: &Path,
         options: &PdfExportOptions,
     ) -> Result<ExportSummary, DocumentError> {
+        let (title, pages, _) = self.export_pages(document_id)?;
+        self.exporter
+            .export_pdf(&title, &pages, options, output)
+            .map_err(export_error)
+    }
+
+    /// Exports the document as an editable Word file at `output`, rebuilt
+    /// from the pages' recognized text. Pages still waiting for recognition
+    /// come out empty: [`DocxExport::pages_pending_text`] says how many, so
+    /// callers can recognize them first.
+    pub fn export_docx(
+        &self,
+        document_id: DocumentId,
+        output: &Path,
+        options: &DocxExportOptions,
+    ) -> Result<DocxExport, DocumentError> {
+        let (title, pages, pages_pending_text) = self.export_pages(document_id)?;
+        let summary = self
+            .exporter
+            .export_docx(&title, &pages, options, output)
+            .map_err(export_error)?;
+        Ok(DocxExport {
+            summary,
+            pages_pending_text,
+        })
+    }
+
+    /// The document's title, its pages ready to export (displayed image and
+    /// current text), and how many pages have no current text yet.
+    fn export_pages(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<(String, Vec<ExportPage>, u32), DocumentError> {
         let document = self
             .repository
             .get_document(document_id)?
@@ -322,6 +355,7 @@ where
         if pages.is_empty() {
             return Err(DocumentError::EmptyDocument(document_id));
         }
+        let mut pending = 0;
         let pages = pages
             .into_iter()
             .map(|page| {
@@ -330,25 +364,17 @@ where
                 let text = self
                     .repository
                     .get_page_text(page.id)?
-                    .filter(|t| t.source_path == image)
-                    .map(|t| t.lines)
-                    .unwrap_or_default();
+                    .filter(|t| t.source_path == image);
+                if text.is_none() {
+                    pending += 1;
+                }
                 Ok(ExportPage {
                     image: self.files.resolve(&image),
-                    text,
+                    text: text.map(|t| t.lines).unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<_>, DocumentError>>()?;
-
-        self.exporter
-            .export_pdf(&document.title, &pages, options, output)
-            .map_err(|error| match error {
-                ProcessingError::UnsupportedFormat => DocumentError::UnsupportedImageFormat {
-                    extension: "page image".into(),
-                },
-                ProcessingError::InvalidCorners(reason) => DocumentError::InvalidCorners { reason },
-                ProcessingError::Failed(port) => DocumentError::Storage(port),
-            })
+        Ok((document.title, pages, pending))
     }
 }
 
@@ -385,6 +411,24 @@ fn normalize_title(title: &str) -> Result<String, DocumentError> {
         });
     }
     Ok(trimmed.to_owned())
+}
+
+/// Result of [`DocumentService::export_docx`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocxExport {
+    pub summary: ExportSummary,
+    /// Pages exported without text because it wasn't recognized yet.
+    pub pages_pending_text: u32,
+}
+
+fn export_error(error: ProcessingError) -> DocumentError {
+    match error {
+        ProcessingError::UnsupportedFormat => DocumentError::UnsupportedImageFormat {
+            extension: "page image".into(),
+        },
+        ProcessingError::InvalidCorners(reason) => DocumentError::InvalidCorners { reason },
+        ProcessingError::Failed(port) => DocumentError::Storage(port),
+    }
 }
 
 /// The image a page shows: its processed image, or the original.
@@ -716,6 +760,23 @@ mod tests {
                 size_bytes: 1,
             })
         }
+
+        fn export_docx(
+            &self,
+            title: &str,
+            pages: &[ExportPage],
+            _options: &DocxExportOptions,
+            _output: &Path,
+        ) -> Result<ExportSummary, ProcessingError> {
+            self.exported
+                .lock()
+                .unwrap()
+                .push((format!("docx:{title}"), pages.to_vec()));
+            Ok(ExportSummary {
+                page_count: pages.len() as u32,
+                size_bytes: 2,
+            })
+        }
     }
 
     type TestService =
@@ -1002,6 +1063,40 @@ mod tests {
             .map(|p| p.text.iter().map(|l| l.text.as_str()).collect())
             .collect();
         assert_eq!(texts, vec![vec!["Total"], vec![], vec![]]);
+    }
+
+    #[test]
+    fn docx_export_reports_pages_still_pending() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Carta").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let read = svc.add_page(doc.id, &img).unwrap();
+        svc.add_page(doc.id, &img).unwrap();
+        let image = svc.files().resolve(&read.original_path);
+        svc.save_page_text(read.id, &image, vec![text_line(0, "Estimado")])
+            .unwrap();
+
+        let export = svc
+            .export_docx(
+                doc.id,
+                Path::new("/out.docx"),
+                &DocxExportOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(export.pages_pending_text, 1);
+        assert_eq!(export.summary.page_count, 2);
+        let exported = svc.exporter.exported.lock().unwrap();
+        assert_eq!(exported[0].0, "docx:Carta");
+        drop(exported);
+        assert!(matches!(
+            svc.export_docx(
+                DocumentId::new(),
+                Path::new("/x.docx"),
+                &DocxExportOptions::default()
+            ),
+            Err(DocumentError::DocumentNotFound(_))
+        ));
     }
 
     #[test]
