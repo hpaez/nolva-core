@@ -1,0 +1,22 @@
+[package]
+name = "docx-engine"
+description = "Word (.docx) generation for Nolva: editable documents from recognized page text."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+image-engine.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+image = { workspace = true, features = ["jpeg"] }
+# Reading the package back in tests.
+zip.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -10,10 +10,12 @@
 mod filters;
 mod io;
 mod perspective;
+mod upright;
 
 pub use filters::{Filter, apply_filter};
 pub use io::{JPEG_QUALITY, load_oriented, save_jpeg};
 pub use perspective::{MAX_OUTPUT_SIDE, correct_perspective, output_size};
+pub use upright::{UprightJpeg, upright_jpeg};
 
 use std::path::PathBuf;
 

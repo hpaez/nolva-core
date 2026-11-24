@@ -131,7 +131,7 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         let image_id = alloc();
         let content_id = alloc();
 
-        let mut image = pdf.image_xobject(image_id, &embedded.jpeg);
+        let mut image = pdf.image_xobject(image_id, &embedded.bytes);
         image.filter(pdf_writer::Filter::DctDecode);
         image.width(embedded.width as i32);
         image.height(embedded.height as i32);

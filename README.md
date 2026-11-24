@@ -10,7 +10,9 @@ crates/
   document-engine/   Domain model and use cases (no I/O; defines ports)
   scanner-engine/    Document detection: finds the page corners in photos and live camera frames
   image-engine/      Oriented decoding, perspective correction, filters, JPEG encoding
-  pdf-engine/        Multi-page PDF export (JPEGs embedded without recompression)
+  pdf-engine/        Multi-page PDF export (JPEGs embedded without recompression,
+                     recognized text as an invisible selectable layer)
+  docx-engine/       Word export: paragraphs rebuilt from recognized text
   storage-engine/    SQLite (metadata) + file system (images)
   core-ffi/          Public UniFFI API (lib: nolva_core)
 tools/uniffi-bindgen Bindings generator pinned to the uniffi version
