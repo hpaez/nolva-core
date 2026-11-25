@@ -1,0 +1,60 @@
+# Keeps GitHub Packages storage small: deletes all but the newest versions
+# of app.nolva:nolva-core. The Free plan shares 500 MB between Packages and
+# Actions artifacts, and every release adds an .aar with native libraries
+# for three ABIs.
+#
+# Runs after each successful release, monthly as a safety net, and by hand.
+# An app pinned to a deleted version can no longer resolve it: keep at
+# least as many versions as anything may still depend on.
+
+name: Prune packages
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: "17 6 1 * *" # monthly
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Newest versions to keep (at least 2)"
+        required: true
+        default: "5"
+
+concurrency:
+  group: prune-packages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prune:
+    # After a release only if it succeeded: a failed one published nothing.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KEEP: ${{ inputs.keep || '5' }}
+      PACKAGE: app.nolva.nolva-core
+    steps:
+      - name: Check how many to keep
+        run: |
+          [[ "$KEEP" =~ ^[0-9]+$ ]] && (( KEEP >= 2 )) || { echo "::error::keep must be a number, at least 2"; exit 1; }
+
+      - name: List versions (newest first)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Informational: the log shows what is kept and what goes.
+        run: |
+          gh api "users/${{ github.repository_owner }}/packages/maven/$PACKAGE/versions" \
+            --paginate --jq '.[].name' | awk -v keep="$KEEP" '{ print (NR <= keep ? "keep   " : "delete ") $0 }' \
+            || echo "::warning::could not list versions"
+
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ env.PACKAGE }}
+          package-type: maven
+          min-versions-to-keep: ${{ env.KEEP }}
