@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use document_engine::{
-    Crop, Document, DocumentError, DocumentId, DocumentService, Page, PageFileStore, PageId,
-    PageText, PdfExportOptions, SystemClock, TextBounds, TextLine,
+    Crop, Document, DocumentError, DocumentId, DocumentService, FolderId, Page, PageFileStore,
+    PageId, PageText, PdfExportOptions, SystemClock, TextBounds, TextLine,
 };
 use storage_engine::{DATABASE_FILE_NAME, LocalPageFileStore, SqliteDocumentRepository};
 
@@ -95,6 +95,35 @@ pub struct DocumentInfo {
     pub cover_path: Option<String>,
     /// When it was moved to the trash; `None` while it isn't.
     pub trashed_at_ms: Option<i64>,
+    /// Folder it's in; `None` for the top level.
+    pub folder_id: Option<String>,
+    /// Bytes its page images take. Filled in by listings
+    /// (`list_documents`, `list_trashed_documents`) and by restore and
+    /// duplicate; 0 elsewhere.
+    pub size_bytes: u64,
+}
+
+/// A folder of documents. Folders don't nest.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FolderInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// Documents in it, not counting trashed ones.
+    pub document_count: u32,
+}
+
+impl From<document_engine::Folder> for FolderInfo {
+    fn from(f: document_engine::Folder) -> Self {
+        Self {
+            id: f.id.to_string(),
+            name: f.name,
+            created_at_ms: f.created_at_ms,
+            updated_at_ms: f.updated_at_ms,
+            document_count: f.document_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -292,6 +321,7 @@ impl From<DocumentError> for NolvaError {
             DocumentError::PageImageChanged(_) => Self::Conflict { reason },
             DocumentError::DocumentNotFound(_)
             | DocumentError::PageNotFound(_)
+            | DocumentError::FolderNotFound(_)
             | DocumentError::SourceImageNotFound(_) => Self::NotFound { reason },
             DocumentError::UnsupportedImageFormat { .. } => Self::Unsupported { reason },
             DocumentError::Storage(_) => Self::Storage { reason },
@@ -339,6 +369,57 @@ impl NolvaCore {
 
     pub fn create_document(&self, title: String) -> Result<DocumentInfo, NolvaError> {
         Ok(self.document_info(self.service.create_document(&title)?))
+    }
+
+    /// Creates an empty document in a folder (`None`: the top level).
+    pub fn create_document_in_folder(
+        &self,
+        title: String,
+        folder_id: Option<String>,
+    ) -> Result<DocumentInfo, NolvaError> {
+        let folder = folder_id.map(|f| f.parse::<FolderId>()).transpose()?;
+        Ok(self.document_info(self.service.create_document_in(&title, folder)?))
+    }
+
+    /// Creates a folder. Names follow the same rules as document titles.
+    pub fn create_folder(&self, name: String) -> Result<FolderInfo, NolvaError> {
+        Ok(self.service.create_folder(&name)?.into())
+    }
+
+    /// All folders, by name (ignoring case), with their document counts.
+    pub fn list_folders(&self) -> Result<Vec<FolderInfo>, NolvaError> {
+        Ok(self
+            .service
+            .list_folders()?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    pub fn rename_folder(&self, folder_id: String, name: String) -> Result<FolderInfo, NolvaError> {
+        let id: FolderId = folder_id.parse()?;
+        Ok(self.service.rename_folder(id, &name)?.into())
+    }
+
+    /// Deletes a folder. Its documents are kept and move to the top level.
+    pub fn delete_folder(&self, folder_id: String) -> Result<(), NolvaError> {
+        let id: FolderId = folder_id.parse()?;
+        Ok(self.service.delete_folder(id)?)
+    }
+
+    /// Moves documents into a folder (`None`: the top level), atomically.
+    /// Returns how many moved; ids that no longer exist are skipped.
+    pub fn move_documents(
+        &self,
+        document_ids: Vec<String>,
+        folder_id: Option<String>,
+    ) -> Result<u32, NolvaError> {
+        let ids = document_ids
+            .iter()
+            .map(|id| id.parse::<DocumentId>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let folder = folder_id.map(|f| f.parse::<FolderId>()).transpose()?;
+        Ok(self.service.move_documents(&ids, folder)?)
     }
 
     pub fn list_documents(&self) -> Result<Vec<DocumentInfo>, NolvaError> {
@@ -647,6 +728,8 @@ impl NolvaCore {
                 .cover_path
                 .map(|p| files.resolve(&p).to_string_lossy().into_owned()),
             trashed_at_ms: d.trashed_at_ms,
+            folder_id: d.folder_id.map(|f| f.to_string()),
+            size_bytes: d.size_bytes,
         }
     }
 
@@ -797,6 +880,62 @@ mod tests {
             (doc.id.as_str(), page.id.as_str())
         );
         assert!(core.search_text("  ".into()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn folders_and_sizes() {
+        let data = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let img = src_dir.path().join("shot.png");
+        std::fs::write(&img, b"png-bytes").unwrap();
+        let core = core(&data);
+
+        let folder = core.create_folder("Cuentas".into()).unwrap();
+        let inside = core
+            .create_document_in_folder("Luz".into(), Some(folder.id.clone()))
+            .unwrap();
+        core.add_page(inside.id.clone(), img.to_string_lossy().into_owned())
+            .unwrap();
+        let loose = core.create_document("Agua".into()).unwrap();
+        assert_eq!(
+            core.move_documents(vec![loose.id.clone()], Some(folder.id.clone()))
+                .unwrap(),
+            1
+        );
+
+        let folders = core.list_folders().unwrap();
+        assert_eq!(
+            (folders[0].name.as_str(), folders[0].document_count),
+            ("Cuentas", 2)
+        );
+        let listed = core.list_documents().unwrap();
+        let luz = listed.iter().find(|d| d.id == inside.id).unwrap();
+        assert_eq!(
+            (luz.folder_id.as_deref(), luz.size_bytes),
+            (Some(folder.id.as_str()), 9)
+        );
+
+        assert_eq!(
+            core.rename_folder(folder.id.clone(), "Hogar".into())
+                .unwrap()
+                .name,
+            "Hogar"
+        );
+        core.delete_folder(folder.id.clone()).unwrap();
+        assert!(
+            core.list_documents()
+                .unwrap()
+                .iter()
+                .all(|d| d.folder_id.is_none())
+        );
+        assert!(matches!(
+            core.delete_folder(folder.id),
+            Err(NolvaError::NotFound { .. })
+        ));
+        assert!(matches!(
+            core.move_documents(vec!["not-a-uuid".into()], None),
+            Err(NolvaError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

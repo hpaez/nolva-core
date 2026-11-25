@@ -14,7 +14,9 @@ mod text;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{DocumentError, PortError, ProcessingError};
-pub use model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
+pub use model::{
+    Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
+};
 pub use ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
     ExportPage, ExportSummary, PageFileStore, PageProcessor, PaperSize, PdfExportOptions,

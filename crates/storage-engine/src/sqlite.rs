@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use document_engine::{
-    Crop, Document, DocumentId, DocumentRepository, NewPage, Page, PageFilter, PageId, PageText,
-    PortError, TextBounds, TextLine, TextMatch,
+    Crop, Document, DocumentId, DocumentRepository, Folder, FolderId, NewPage, Page, PageFilter,
+    PageId, PageText, PortError, TextBounds, TextLine, TextMatch,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -65,7 +65,7 @@ const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.created_at_ms, d.updated_at_ms,
      (SELECT COUNT(*) FROM pages p WHERE p.document_id = d.id), \
      (SELECT COALESCE(p.processed_path, p.original_path) FROM pages p \
       WHERE p.document_id = d.id ORDER BY p.position LIMIT 1), \
-     d.trashed_at_ms";
+     d.trashed_at_ms, d.folder_id";
 
 fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
     Ok(Document {
@@ -76,6 +76,20 @@ fn document_from_row(row: &Row<'_>) -> rusqlite::Result<Document> {
         page_count: row.get(4)?,
         cover_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
         trashed_at_ms: row.get(6)?,
+        folder_id: row
+            .get::<_, Option<String>>(7)?
+            .map(|id| {
+                id.parse().map_err(|e: document_engine::DocumentError| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        e.into(),
+                    )
+                })
+            })
+            .transpose()?,
+        // Sizes come from the files, not the database.
+        size_bytes: 0,
     })
 }
 
@@ -90,6 +104,19 @@ fn fts_query(input: &str) -> Option<String> {
         .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+const FOLDER_COLUMNS: &str = "f.id, f.name, f.created_at_ms, f.updated_at_ms, \
+     (SELECT COUNT(*) FROM documents d WHERE d.folder_id = f.id AND d.trashed_at_ms IS NULL)";
+
+fn folder_from_row(row: &Row<'_>) -> rusqlite::Result<Folder> {
+    Ok(Folder {
+        id: parse_id(row, 0)?,
+        name: row.get(1)?,
+        created_at_ms: row.get(2)?,
+        updated_at_ms: row.get(3)?,
+        document_count: row.get(4)?,
+    })
 }
 
 const PAGE_COLUMNS: &str =
@@ -229,9 +256,15 @@ impl DocumentRepository for SqliteDocumentRepository {
     fn insert_document(&self, d: &Document) -> Result<(), PortError> {
         self.conn()
             .execute(
-                "INSERT INTO documents (id, title, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![d.id.to_string(), d.title, d.created_at_ms, d.updated_at_ms],
+                "INSERT INTO documents (id, title, created_at_ms, updated_at_ms, folder_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    d.id.to_string(),
+                    d.title,
+                    d.created_at_ms,
+                    d.updated_at_ms,
+                    d.folder_id.map(|f| f.to_string())
+                ],
             )
             .map_err(|e| PortError::new("insert document", e))?;
         Ok(())
@@ -291,6 +324,109 @@ impl DocumentRepository for SqliteDocumentRepository {
             )
             .map_err(|e| PortError::new("trash document", e))?;
         Ok(changed > 0)
+    }
+
+    fn files_by_document(&self) -> Result<Vec<(DocumentId, PathBuf)>, PortError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT document_id, original_path FROM pages
+                 UNION ALL
+                 SELECT document_id, processed_path FROM pages WHERE processed_path IS NOT NULL",
+            )
+            .map_err(|e| PortError::new("list document files", e))?;
+        stmt.query_map([], |row| {
+            Ok((parse_id(row, 0)?, PathBuf::from(row.get::<_, String>(1)?)))
+        })
+        .and_then(Iterator::collect)
+        .map_err(|e| PortError::new("list document files", e))
+    }
+
+    fn insert_folder(&self, f: &Folder) -> Result<(), PortError> {
+        self.conn()
+            .execute(
+                "INSERT INTO folders (id, name, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![f.id.to_string(), f.name, f.created_at_ms, f.updated_at_ms],
+            )
+            .map_err(|e| PortError::new("insert folder", e))?;
+        Ok(())
+    }
+
+    fn get_folder(&self, id: FolderId) -> Result<Option<Folder>, PortError> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {FOLDER_COLUMNS} FROM folders f WHERE f.id = ?1"),
+                params![id.to_string()],
+                folder_from_row,
+            )
+            .optional()
+            .map_err(|e| PortError::new("get folder", e))
+    }
+
+    fn list_folders(&self) -> Result<Vec<Folder>, PortError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(&format!(
+                "SELECT {FOLDER_COLUMNS} FROM folders f ORDER BY f.name COLLATE NOCASE, f.id"
+            ))
+            .map_err(|e| PortError::new("list folders", e))?;
+        stmt.query_map([], folder_from_row)
+            .and_then(Iterator::collect)
+            .map_err(|e| PortError::new("list folders", e))
+    }
+
+    fn rename_folder(
+        &self,
+        id: FolderId,
+        name: &str,
+        updated_at_ms: i64,
+    ) -> Result<Option<Folder>, PortError> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE folders SET name = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                params![id.to_string(), name, updated_at_ms],
+            )
+            .map_err(|e| PortError::new("rename folder", e))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_folder(id)
+    }
+
+    fn delete_folder(&self, id: FolderId) -> Result<bool, PortError> {
+        // documents.folder_id is ON DELETE SET NULL: they move to the top level.
+        let changed = self
+            .conn()
+            .execute("DELETE FROM folders WHERE id = ?1", params![id.to_string()])
+            .map_err(|e| PortError::new("delete folder", e))?;
+        Ok(changed > 0)
+    }
+
+    fn move_documents(
+        &self,
+        documents: &[DocumentId],
+        folder: Option<FolderId>,
+    ) -> Result<u32, PortError> {
+        let ctx = "move documents";
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PortError::new(ctx, e))?;
+        let folder = folder.map(|f| f.to_string());
+        let mut moved = 0;
+        {
+            let mut update = tx
+                .prepare("UPDATE documents SET folder_id = ?2 WHERE id = ?1")
+                .map_err(|e| PortError::new(ctx, e))?;
+            for id in documents {
+                moved += update
+                    .execute(params![id.to_string(), folder])
+                    .map_err(|e| PortError::new(ctx, e))? as u32;
+            }
+        }
+        tx.commit().map_err(|e| PortError::new(ctx, e))?;
+        Ok(moved)
     }
 
     fn trashed_before(&self, cutoff_ms: i64) -> Result<Vec<DocumentId>, PortError> {
@@ -695,6 +831,8 @@ mod tests {
             page_count: 0,
             cover_path: None,
             trashed_at_ms: None,
+            folder_id: None,
+            size_bytes: 0,
         }
     }
 
@@ -1038,6 +1176,91 @@ mod tests {
         );
         assert_eq!(fts_query("di\"jo"), Some("\"di\"\"jo\"*".into()));
         assert_eq!(fts_query(" - * "), None);
+    }
+
+    fn folder(name: &str) -> Folder {
+        Folder {
+            id: FolderId::new(),
+            name: name.into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            document_count: 0,
+        }
+    }
+
+    #[test]
+    fn folders_count_documents_and_release_them_when_deleted() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let (bills, work) = (folder("cuentas"), folder("Archivo"));
+        repo.insert_folder(&bills).unwrap();
+        repo.insert_folder(&work).unwrap();
+        let names: Vec<_> = repo
+            .list_folders()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, ["Archivo", "cuentas"]);
+
+        let inside = Document {
+            folder_id: Some(bills.id),
+            ..doc("Luz", 1)
+        };
+        let (moved, trashed) = (doc("Agua", 2), doc("Gas", 3));
+        for d in [&inside, &moved, &trashed] {
+            repo.insert_document(d).unwrap();
+        }
+        assert_eq!(
+            repo.get_document(inside.id).unwrap().unwrap().folder_id,
+            Some(bills.id)
+        );
+        let ids = [moved.id, trashed.id, DocumentId::new()];
+        assert_eq!(repo.move_documents(&ids, Some(bills.id)).unwrap(), 2);
+        repo.set_document_trashed(trashed.id, Some(9)).unwrap();
+        assert_eq!(
+            repo.get_folder(bills.id).unwrap().unwrap().document_count,
+            2
+        );
+
+        let renamed = repo.rename_folder(work.id, "Trabajo", 5).unwrap().unwrap();
+        assert_eq!(
+            (renamed.name.as_str(), renamed.updated_at_ms),
+            ("Trabajo", 5)
+        );
+        assert_eq!(repo.rename_folder(FolderId::new(), "x", 5).unwrap(), None);
+
+        assert!(repo.delete_folder(bills.id).unwrap());
+        assert!(!repo.delete_folder(bills.id).unwrap());
+        for id in [inside.id, moved.id, trashed.id] {
+            assert_eq!(repo.get_document(id).unwrap().unwrap().folder_id, None);
+        }
+        assert_eq!(
+            repo.move_documents(&[inside.id], Some(bills.id)).ok(),
+            None,
+            "folder must exist"
+        );
+    }
+
+    #[test]
+    fn files_by_document_lists_every_image() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let page = repo.append_page(&new_page(d.id, 2)).unwrap();
+        repo.set_page_rendering(
+            page.id,
+            None,
+            PageFilter::Grayscale,
+            Some(Path::new("g.jpg")),
+            3,
+        )
+        .unwrap();
+
+        let mut files = repo.files_by_document().unwrap();
+        files.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut expected = vec![(d.id, page.original_path), (d.id, PathBuf::from("g.jpg"))];
+        expected.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(files, expected);
     }
 
     #[test]

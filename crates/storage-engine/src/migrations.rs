@@ -82,6 +82,20 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX documents_trashed_idx ON documents(trashed_at_ms)
         WHERE trashed_at_ms IS NOT NULL;
     "#,
+    // 6: folders, one level deep. Deleting a folder keeps its documents,
+    // which move back to the top level.
+    r#"
+    CREATE TABLE folders (
+        id            TEXT PRIMARY KEY NOT NULL,
+        name          TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    ) STRICT;
+
+    ALTER TABLE documents ADD COLUMN folder_id TEXT
+        REFERENCES folders(id) ON DELETE SET NULL;
+    CREATE INDEX documents_folder_idx ON documents(folder_id);
+    "#,
 ];
 
 /// Schema 1 as shipped in v0.1, for migration tests.
