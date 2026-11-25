@@ -134,11 +134,53 @@ pub struct Page {
     pub crop: Option<Crop>,
     /// Filter applied to the processed image.
     pub filter: PageFilter,
-    /// Cropped and/or filtered image, relative to the storage root. `None`
-    /// while the page has neither a crop nor a filter; the original is never
+    /// Turn applied after the crop.
+    pub rotation: Rotation,
+    /// Cropped, filtered and/or rotated image, relative to the storage root.
+    /// `None` while the page has none of them; the original is never
     /// modified.
     pub processed_path: Option<PathBuf>,
     pub created_at_ms: i64,
+}
+
+/// Clockwise turn of a page, applied after its crop. Non-destructive like
+/// the crop and filter: the original is never rotated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Rotation {
+    #[default]
+    None,
+    Clockwise90,
+    Clockwise180,
+    Clockwise270,
+}
+
+impl Rotation {
+    pub fn degrees(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Clockwise90 => 90,
+            Self::Clockwise180 => 180,
+            Self::Clockwise270 => 270,
+        }
+    }
+
+    /// Accepts 0, 90, 180 or 270.
+    pub fn from_degrees(degrees: u32) -> Result<Self, DocumentError> {
+        match degrees {
+            0 => Ok(Self::None),
+            90 => Ok(Self::Clockwise90),
+            180 => Ok(Self::Clockwise180),
+            270 => Ok(Self::Clockwise270),
+            _ => Err(DocumentError::InvalidRotation { degrees }),
+        }
+    }
+
+    /// This rotation turned a further quarter clockwise (or counterclockwise).
+    pub fn turned(self, clockwise: bool) -> Self {
+        let step = if clockwise { 90 } else { 270 };
+        // Always a multiple of 90 below 360, so this can't fail.
+        Self::from_degrees((self.degrees() + step) % 360).unwrap_or_default()
+    }
 }
 
 /// Look applied to a page on top of its crop. Filters are re-applied from the

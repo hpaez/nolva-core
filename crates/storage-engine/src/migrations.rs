@@ -96,6 +96,11 @@ const MIGRATIONS: &[&str] = &[
         REFERENCES folders(id) ON DELETE SET NULL;
     CREATE INDEX documents_folder_idx ON documents(folder_id);
     "#,
+    // 7: non-destructive rotation, in clockwise degrees, applied after the crop.
+    r#"
+    ALTER TABLE pages ADD COLUMN rotation INTEGER NOT NULL DEFAULT 0
+        CHECK (rotation IN (0, 90, 180, 270));
+    "#,
 ];
 
 /// Schema 1 as shipped in v0.1, for migration tests.

@@ -56,6 +56,9 @@ pub enum DocumentError {
     #[error("folder not found: {0}")]
     FolderNotFound(FolderId),
 
+    #[error("invalid rotation: {degrees}° (use 0, 90, 180 or 270)")]
+    InvalidRotation { degrees: u32 },
+
     #[error("document has no pages: {0}")]
     EmptyDocument(DocumentId),
 
