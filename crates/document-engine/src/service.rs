@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::annotation::{
+    Annotation, MAX_SIGNATURES, Point, Signature, validate_all, validate_signature,
+};
 use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
 use crate::model::{
     Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
-    Rotation,
+    Rotation, SignatureId,
 };
 use crate::ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
@@ -238,6 +241,63 @@ where
             .filter(|text| text.source_path == current))
     }
 
+    /// A page's annotations, bottom to top.
+    pub fn annotations(&self, page_id: PageId) -> Result<Vec<Annotation>, DocumentError> {
+        self.get_page(page_id)?;
+        Ok(self.repository.get_annotations(page_id)?)
+    }
+
+    /// Replaces a page's annotations (all of them: editors keep their own
+    /// undo history and save the result). Points slightly outside the page
+    /// are pulled in; anything that can't be drawn is rejected.
+    pub fn set_annotations(
+        &self,
+        page_id: PageId,
+        annotations: Vec<Annotation>,
+    ) -> Result<(), DocumentError> {
+        let annotations = validate_all(annotations)?;
+        self.get_page(page_id)?;
+        Ok(self
+            .repository
+            .set_annotations(page_id, &annotations, self.clock.now_ms())?)
+    }
+
+    /// Saves a handwritten signature to place on pages later. Its strokes
+    /// are in its own box: see [`Signature`].
+    pub fn save_signature(
+        &self,
+        strokes: Vec<Vec<Point>>,
+        aspect_ratio: f32,
+    ) -> Result<Signature, DocumentError> {
+        let strokes = validate_signature(strokes, aspect_ratio)?;
+        if self.repository.list_signatures()?.len() >= MAX_SIGNATURES {
+            return Err(DocumentError::InvalidAnnotation {
+                reason: format!("at most {MAX_SIGNATURES} saved signatures"),
+            });
+        }
+        let signature = Signature {
+            id: SignatureId::new(),
+            strokes,
+            aspect_ratio,
+            created_at_ms: self.clock.now_ms(),
+        };
+        self.repository.insert_signature(&signature)?;
+        Ok(signature)
+    }
+
+    pub fn list_signatures(&self) -> Result<Vec<Signature>, DocumentError> {
+        Ok(self.repository.list_signatures()?)
+    }
+
+    /// Forgets a saved signature. Pages it was placed on keep it.
+    pub fn delete_signature(&self, id: SignatureId) -> Result<(), DocumentError> {
+        if self.repository.delete_signature(id)? {
+            Ok(())
+        } else {
+            Err(DocumentError::SignatureNotFound(id))
+        }
+    }
+
     /// Pages whose text contains every word of `query`, best match first.
     pub fn search_text(&self, query: &str) -> Result<Vec<TextMatch>, DocumentError> {
         if query.trim().is_empty() {
@@ -408,6 +468,11 @@ where
             };
             self.repository.save_page_text(&copy, &copy.plain_text())?;
         }
+        let annotations = self.repository.get_annotations(page.id)?;
+        if !annotations.is_empty() {
+            self.repository
+                .set_annotations(page_id, &annotations, now)?;
+        }
         Ok(())
     }
 
@@ -540,6 +605,20 @@ where
         self.render(page, crop, filter, rotation)
     }
 
+    /// Turns `page`'s annotations along with the page, to `rotation`.
+    fn turn_annotations(&self, page: &Page, rotation: Rotation) -> Result<(), DocumentError> {
+        let annotations = self.repository.get_annotations(page.id)?;
+        if annotations.is_empty() {
+            return Ok(());
+        }
+        let delta =
+            Rotation::from_degrees((rotation.degrees() + 360 - page.rotation.degrees()) % 360)?;
+        let turned: Vec<_> = annotations.into_iter().map(|a| a.turned(delta)).collect();
+        Ok(self
+            .repository
+            .set_annotations(page.id, &turned, self.clock.now_ms())?)
+    }
+
     /// Re-renders `page` with `crop`, `filter` and `rotation`.
     ///
     /// The new image goes to a fresh path and the database is updated only
@@ -586,6 +665,25 @@ where
                 }
                 DocumentError::from(err)
             })?;
+
+        if rotation != page.rotation {
+            if let Err(err) = self.turn_annotations(&page, rotation) {
+                // Put the page back as it was rather than turn it without its
+                // annotations. Its previous image hasn't been removed yet.
+                let _ = self.repository.set_page_rendering(
+                    page.id,
+                    page.crop.as_ref(),
+                    page.filter,
+                    page.rotation,
+                    page.processed_path.as_deref(),
+                    self.clock.now_ms(),
+                );
+                if let Some(path) = &processed {
+                    let _ = self.files.remove_file(path);
+                }
+                return Err(err);
+            }
+        }
 
         if let Some(previous) = page.processed_path {
             // Best effort: an orphan here only wastes space until cleanup.
@@ -668,6 +766,7 @@ where
                 Ok(ExportPage {
                     image: self.files.resolve(&image),
                     text: text.map(|t| t.lines).unwrap_or_default(),
+                    annotations: self.repository.get_annotations(page.id)?,
                 })
             })
             .collect::<Result<Vec<_>, DocumentError>>()?;
@@ -761,6 +860,9 @@ mod tests {
         texts: Mutex<HashMap<PageId, (PageText, String)>>,
         searched: Mutex<Option<String>>,
         folders: Mutex<HashMap<FolderId, Folder>>,
+        annotations: Mutex<HashMap<PageId, Vec<Annotation>>>,
+        signatures: Mutex<Vec<Signature>>,
+        fail_annotations: bool,
     }
 
     impl DocumentRepository for InMemoryRepo {
@@ -1043,6 +1145,43 @@ mod tests {
         fn search_text(&self, query: &str, _limit: u32) -> Result<Vec<TextMatch>, PortError> {
             *self.searched.lock().unwrap() = Some(query.to_owned());
             Ok(Vec::new())
+        }
+        fn get_annotations(&self, page_id: PageId) -> Result<Vec<Annotation>, PortError> {
+            Ok(self
+                .annotations
+                .lock()
+                .unwrap()
+                .get(&page_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn set_annotations(
+            &self,
+            page_id: PageId,
+            annotations: &[Annotation],
+            _updated_at_ms: i64,
+        ) -> Result<(), PortError> {
+            if self.fail_annotations {
+                return Err(PortError::new("set_annotations", "simulated failure"));
+            }
+            self.annotations
+                .lock()
+                .unwrap()
+                .insert(page_id, annotations.to_vec());
+            Ok(())
+        }
+        fn insert_signature(&self, signature: &Signature) -> Result<(), PortError> {
+            self.signatures.lock().unwrap().push(signature.clone());
+            Ok(())
+        }
+        fn list_signatures(&self) -> Result<Vec<Signature>, PortError> {
+            Ok(self.signatures.lock().unwrap().clone())
+        }
+        fn delete_signature(&self, id: SignatureId) -> Result<bool, PortError> {
+            let mut all = self.signatures.lock().unwrap();
+            let before = all.len();
+            all.retain(|s| s.id != id);
+            Ok(all.len() < before)
         }
         fn referenced_files(&self) -> Result<Vec<PathBuf>, PortError> {
             let pages = self.pages.lock().unwrap();
@@ -1993,5 +2132,149 @@ mod tests {
             svc.list_pages(copy.id).unwrap()[0].rotation,
             Rotation::Clockwise90
         );
+    }
+
+    fn pen(x: f32, y: f32) -> Annotation {
+        Annotation::Ink {
+            strokes: vec![vec![Point::new(x, y), Point::new(x, y + 0.1)]],
+            color: 0x1A_4D_8F,
+            width: 0.005,
+        }
+    }
+
+    fn assert_close(actual: &[Annotation], expected: &[Annotation]) {
+        let points = |a: &[Annotation]| -> Vec<Point> {
+            a.iter()
+                .flat_map(|a| match a {
+                    Annotation::Ink { strokes, .. } => strokes.concat(),
+                    _ => Vec::new(),
+                })
+                .collect()
+        };
+        let (a, e) = (points(actual), points(expected));
+        assert_eq!(a.len(), e.len());
+        for (a, e) in a.iter().zip(&e) {
+            assert!(
+                (a.x - e.x).abs() < 1e-5 && (a.y - e.y).abs() < 1e-5,
+                "{a:?} vs {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotations_are_saved_validated_and_exported() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Contrato").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        assert!(svc.annotations(page.id).unwrap().is_empty());
+
+        let note = Annotation::Text {
+            text: "Firmado".into(),
+            x: 0.1,
+            y: 1.3, // pulled into the page
+            size: 0.03,
+            color: 0,
+        };
+        svc.set_annotations(page.id, vec![pen(0.2, 0.2), note])
+            .unwrap();
+        let saved = svc.annotations(page.id).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(matches!(saved[1], Annotation::Text { y, .. } if y == 1.0));
+
+        let bad = Annotation::Highlight {
+            left: 0.3,
+            top: 0.3,
+            right: 0.3,
+            bottom: 0.4,
+            color: 0,
+        };
+        assert!(matches!(
+            svc.set_annotations(page.id, vec![bad]),
+            Err(DocumentError::InvalidAnnotation { .. })
+        ));
+        assert_eq!(svc.annotations(page.id).unwrap(), saved, "kept on error");
+        assert!(matches!(
+            svc.set_annotations(PageId::new(), vec![pen(0.1, 0.1)]),
+            Err(DocumentError::PageNotFound(_))
+        ));
+
+        svc.export_pdf(doc.id, Path::new("/out.pdf"), &PDF).unwrap();
+        let exported = svc.exporter.exported.lock().unwrap();
+        assert_eq!(exported[0].1[0].annotations, saved);
+    }
+
+    #[test]
+    fn annotations_turn_with_the_page_and_survive_duplicates() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        svc.set_annotations(page.id, vec![pen(0.1, 0.2)]).unwrap();
+
+        svc.rotate_page(page.id, true).unwrap();
+        assert_eq!(
+            svc.annotations(page.id).unwrap(),
+            vec![pen(0.1, 0.2).turned(Rotation::Clockwise90)]
+        );
+        // Undoing the turn turns them back (up to float rounding).
+        svc.set_page_rendering(page.id, None, PageFilter::Original, Rotation::None)
+            .unwrap();
+        let back = svc.annotations(page.id).unwrap();
+        assert_close(&back, &[pen(0.1, 0.2)]);
+        // Filters don't move them.
+        svc.set_page_filter(page.id, PageFilter::Grayscale).unwrap();
+        assert_eq!(svc.annotations(page.id).unwrap(), back);
+
+        let copy = svc.duplicate_document(doc.id, "Copia").unwrap();
+        let copied = svc.list_pages(copy.id).unwrap().remove(0);
+        assert_eq!(svc.annotations(copied.id).unwrap(), back);
+    }
+
+    #[test]
+    fn a_page_does_not_turn_without_its_annotations() {
+        let repo = InMemoryRepo {
+            fail_annotations: true,
+            ..InMemoryRepo::default()
+        };
+        let svc = service(repo);
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        svc.repository
+            .annotations
+            .lock()
+            .unwrap()
+            .insert(page.id, vec![pen(0.1, 0.2)]);
+
+        assert!(svc.rotate_page(page.id, true).is_err());
+
+        let page = svc.get_page(page.id).unwrap();
+        assert_eq!((page.rotation, page.processed_path), (Rotation::None, None));
+    }
+
+    #[test]
+    fn signatures_are_saved_listed_and_forgotten() {
+        let svc = service(InMemoryRepo::default());
+        let strokes = vec![vec![Point::new(0.0, 0.8), Point::new(1.0, 0.2)]];
+
+        let saved = svc.save_signature(strokes.clone(), 3.5).unwrap();
+        assert_eq!(svc.list_signatures().unwrap(), vec![saved.clone()]);
+        assert!(svc.save_signature(strokes.clone(), -1.0).is_err());
+
+        for _ in 1..MAX_SIGNATURES {
+            svc.save_signature(strokes.clone(), 3.5).unwrap();
+        }
+        assert!(matches!(
+            svc.save_signature(strokes, 3.5),
+            Err(DocumentError::InvalidAnnotation { .. })
+        ));
+
+        svc.delete_signature(saved.id).unwrap();
+        assert_eq!(svc.list_signatures().unwrap().len(), MAX_SIGNATURES - 1);
+        assert!(matches!(
+            svc.delete_signature(saved.id),
+            Err(DocumentError::SignatureNotFound(_))
+        ));
     }
 }

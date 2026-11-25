@@ -57,6 +57,11 @@ id_type!(
     FolderId
 );
 
+id_type!(
+    /// Identifier of a saved signature.
+    SignatureId
+);
+
 /// A scanned document: an ordered collection of pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {

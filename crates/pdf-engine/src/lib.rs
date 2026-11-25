@@ -12,6 +12,7 @@
 mod embed;
 mod encrypt;
 mod layout;
+mod marks;
 mod numbers;
 mod text;
 
@@ -22,14 +23,17 @@ use std::path::{Path, PathBuf};
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
 pub use layout::{PageSize, PdfOptions};
+pub use marks::Mark;
 pub use text::TextBox;
 
-/// One PDF page: an image and the text recognized in it, if any.
+/// One PDF page: an image, the text recognized in it and annotations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PdfPage {
     pub image: PathBuf,
     /// Lines in reading order, with boxes relative to the upright image.
     pub text: Vec<TextBox>,
+    /// Drawn over the image, bottom to top.
+    pub marks: Vec<Mark>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,11 +169,18 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         ));
         font.finish();
     }
-    let numbers_font_id = alloc();
-    if options.page_numbers {
-        pdf.type1_font(numbers_font_id)
+    // Visible Helvetica for page numbers and text annotations, with its
+    // real metrics (unlike the text layer's font).
+    let visible_font_id = alloc();
+    let any_visible_text = options.page_numbers || pages.iter().any(|p| marks::has_text(&p.marks));
+    if any_visible_text {
+        pdf.type1_font(visible_font_id)
             .base_font(Name(b"Helvetica"))
             .encoding_predefined(Name(b"WinAnsiEncoding"));
+    }
+    let highlight_state_id = alloc();
+    if pages.iter().any(|p| marks::has_highlight(&p.marks)) {
+        marks::write_highlight_state(&mut pdf, highlight_state_id);
     }
 
     let image_name = Name(b"Im0");
@@ -208,6 +219,7 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         content.x_object(image_name);
         content.restore_state();
         text::draw(&mut content, &source.text, &placement);
+        marks::draw(&mut content, &source.marks, &placement, numbers::FONT_NAME);
         if options.page_numbers {
             numbers::draw(
                 &mut content,
@@ -224,14 +236,20 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         let mut resources = page.resources();
         resources.x_objects().pair(image_name, image_id);
         // One /Font dictionary per page: writing it twice would keep only the last.
-        if !source.text.is_empty() || options.page_numbers {
+        let visible_text = options.page_numbers || marks::has_text(&source.marks);
+        if !source.text.is_empty() || visible_text {
             let mut fonts = resources.fonts();
             if !source.text.is_empty() {
                 fonts.pair(text::FONT_NAME, font_id);
             }
-            if options.page_numbers {
-                fonts.pair(numbers::FONT_NAME, numbers_font_id);
+            if visible_text {
+                fonts.pair(numbers::FONT_NAME, visible_font_id);
             }
+        }
+        if marks::has_highlight(&source.marks) {
+            resources
+                .ext_g_states()
+                .pair(marks::HIGHLIGHT_STATE, highlight_state_id);
         }
         resources.finish();
         page.finish();

@@ -5,6 +5,7 @@
 //! ([`DocumentRepository`], [`PageFileStore`], [`PageProcessor`]) that other
 //! crates implement.
 
+mod annotation;
 mod clock;
 mod error;
 mod model;
@@ -12,11 +13,15 @@ mod ports;
 mod service;
 mod text;
 
+pub use annotation::{
+    Annotation, MAX_ANNOTATION_TEXT_CHARS, MAX_ANNOTATIONS_PER_PAGE, MAX_POINTS_PER_PAGE,
+    MAX_SIGNATURES, MAX_STROKE_WIDTH, MAX_TEXT_SIZE, Point, Rgb, Signature,
+};
 pub use clock::{Clock, SystemClock};
 pub use error::{DocumentError, PortError, ProcessingError};
 pub use model::{
     Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
-    Rotation,
+    Rotation, SignatureId,
 };
 pub use ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
