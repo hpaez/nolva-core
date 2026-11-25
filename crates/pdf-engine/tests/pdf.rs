@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use image::codecs::jpeg::JpegEncoder;
 use image::{GrayImage, Luma, Rgb, RgbImage};
 use lopdf::{Document, LoadOptions, Object, ObjectId};
-use pdf_engine::{PageSize, PdfError, PdfOptions, PdfPage, TextBox, write_pdf};
+use pdf_engine::{Mark, PageSize, PdfError, PdfOptions, PdfPage, TextBox, write_pdf};
 
 fn write_jpeg(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
     let path = dir.join(name);
@@ -62,6 +62,7 @@ fn image_pages(images: &[PathBuf]) -> Vec<PdfPage> {
         .map(|image| PdfPage {
             image: image.clone(),
             text: Vec::new(),
+            marks: Vec::new(),
         })
         .collect()
 }
@@ -255,10 +256,12 @@ fn recognized_text_is_an_invisible_selectable_layer() {
         PdfPage {
             image: write_jpeg(dir.path(), "a.jpg", 600, 800),
             text: vec![line("Factura electrónica", 0.1), line("Total: $5.990", 0.2)],
+            marks: Vec::new(),
         },
         PdfPage {
             image: write_jpeg(dir.path(), "b.jpg", 600, 800),
             text: Vec::new(),
+            marks: Vec::new(),
         },
     ];
 
@@ -346,6 +349,7 @@ fn page_numbers_stay_visible_after_an_invisible_text_layer() {
             right: 0.5,
             bottom: 0.15,
         }],
+        marks: Vec::new(),
     }];
     let options = PdfOptions {
         page_numbers: true,
@@ -384,6 +388,7 @@ fn password_protected_pdfs_open_only_with_the_password() {
             right: 0.9,
             bottom: 0.15,
         }],
+        marks: Vec::new(),
     }];
     let options = PdfOptions {
         page_numbers: true,
@@ -449,5 +454,110 @@ fn options_never_print_the_password() {
     assert!(
         !debug.contains("secreto") && debug.contains("***"),
         "{debug}"
+    );
+}
+
+fn marks() -> Vec<Mark> {
+    vec![
+        Mark::Highlight {
+            left: 0.1,
+            top: 0.1,
+            right: 0.9,
+            bottom: 0.15,
+            color: 0xFF_EB_3B,
+        },
+        Mark::Ink {
+            strokes: vec![vec![(0.2, 0.8), (0.4, 0.75), (0.6, 0.82)], vec![(0.7, 0.8)]],
+            color: 0x1A_4D_8F,
+            width: 0.006,
+        },
+        Mark::Text {
+            text: "Recibido conforme\nHugo, 25/11".into(),
+            x: 0.1,
+            y: 0.5,
+            size: 0.03,
+            color: 0xC6_28_28,
+        },
+    ]
+}
+
+#[test]
+fn annotations_are_drawn_as_vectors_over_the_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    let jpeg = write_jpeg(dir.path(), "a.jpg", 600, 800);
+    let pages = vec![
+        PdfPage {
+            image: jpeg.clone(),
+            text: Vec::new(),
+            marks: marks(),
+        },
+        PdfPage {
+            image: jpeg.clone(),
+            text: Vec::new(),
+            marks: Vec::new(),
+        },
+    ];
+
+    write_pdf("x", &pages, &PdfOptions::default(), &output).unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let ids: Vec<_> = doc.get_pages().values().copied().collect();
+    let content = String::from_utf8_lossy(&doc.get_page_content(ids[0])).into_owned();
+    assert!(
+        content.contains(" l\n") && content.contains("S\n"),
+        "strokes: {content}"
+    );
+    assert!(content.contains("/GsHighlight gs"), "highlight: {content}");
+    let text = doc.extract_text(&[1]).unwrap();
+    assert!(
+        text.contains("Recibido conforme") && text.contains("Hugo, 25/11"),
+        "{text:?}"
+    );
+    // The highlight multiplies, translucent, so the scan stays readable.
+    let state = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .find(|d| d.has(b"BM"))
+        .expect("highlight graphics state");
+    assert_eq!(state.get(b"BM").unwrap().as_name().unwrap(), b"Multiply");
+    // Unannotated pages carry nothing extra, and the scan is the same image.
+    assert!(doc.get_page_fonts(ids[1]).unwrap().is_empty());
+    assert_eq!(page_images(&doc).len(), 2);
+}
+
+#[test]
+fn annotations_work_with_numbers_text_and_a_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    let pages = vec![PdfPage {
+        image: write_jpeg(dir.path(), "a.jpg", 600, 800),
+        text: vec![TextBox {
+            text: "Escaneado".into(),
+            left: 0.1,
+            top: 0.3,
+            right: 0.5,
+            bottom: 0.35,
+        }],
+        marks: marks(),
+    }];
+    let options = PdfOptions {
+        page_numbers: true,
+        ..protected("1234")
+    };
+
+    write_pdf("x", &pages, &options, &output).unwrap();
+
+    let doc = Document::load_with_options(&output, LoadOptions::with_password("1234")).unwrap();
+    let text = doc.extract_text(&[1]).unwrap();
+    for expected in ["Escaneado", "Recibido conforme", "1 / 1"] {
+        assert!(text.contains(expected), "{expected} missing: {text:?}");
+    }
+    let id = *doc.get_pages().values().next().unwrap();
+    assert_eq!(
+        doc.get_page_fonts(id).unwrap().len(),
+        2,
+        "text layer + visible"
     );
 }

@@ -101,6 +101,29 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE pages ADD COLUMN rotation INTEGER NOT NULL DEFAULT 0
         CHECK (rotation IN (0, 90, 180, 270));
     "#,
+    // 8: annotations, bottom to top by `position`, and saved signatures.
+    // `geometry` holds normalized coordinates as text: strokes as
+    // "x,y x,y;x,y" (';' between strokes), highlights as "left,top,right,bottom",
+    // text as "x,y". `size` is the stroke width or font size (0 for highlights).
+    r#"
+    CREATE TABLE page_annotations (
+        page_id  TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        kind     TEXT NOT NULL CHECK (kind IN ('ink', 'highlight', 'text')),
+        color    INTEGER NOT NULL CHECK (color BETWEEN 0 AND 16777215),
+        size     REAL NOT NULL,
+        geometry TEXT NOT NULL,
+        text     TEXT,
+        PRIMARY KEY (page_id, position)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE signatures (
+        id            TEXT PRIMARY KEY NOT NULL,
+        strokes       TEXT NOT NULL,
+        aspect_ratio  REAL NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    ) STRICT;
+    "#,
 ];
 
 /// Schema 1 as shipped in v0.1, for migration tests.

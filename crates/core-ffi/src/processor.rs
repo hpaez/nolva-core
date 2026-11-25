@@ -4,14 +4,15 @@
 use std::path::Path;
 
 use document_engine::{
-    CornerDetection, Crop, DocumentExporter, DocxExportOptions, ExportPage, ExportSummary,
-    PageFilter, PageProcessor, PaperSize, PdfExportOptions, PortError, ProcessingError, Rotation,
+    Annotation, CornerDetection, Crop, DocumentExporter, DocxExportOptions, ExportPage,
+    ExportSummary, PageFilter, PageProcessor, PaperSize, PdfExportOptions, PortError,
+    ProcessingError, Rotation,
 };
 use docx_engine::{DocxError, DocxLine, DocxOptions, DocxPage, write_docx};
 use image_engine::{
     Filter, ImageError, apply_filter, correct_perspective, load_oriented, save_jpeg,
 };
-use pdf_engine::{PageSize, PdfError, PdfOptions, PdfPage, TextBox, write_pdf};
+use pdf_engine::{Mark, PageSize, PdfError, PdfOptions, PdfPage, TextBox, write_pdf};
 use scanner_engine::{Point, Quad, detect_document};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -123,6 +124,7 @@ impl DocumentExporter for PdfDocumentExporter {
                         bottom: line.bounds.bottom,
                     })
                     .collect(),
+                marks: page.annotations.iter().map(mark).collect(),
             })
             .collect();
         let summary = write_pdf(title, &pages, &options, output).map_err(|e| match e {
@@ -174,5 +176,48 @@ impl DocumentExporter for PdfDocumentExporter {
             page_count: summary.page_count,
             size_bytes: summary.size_bytes,
         })
+    }
+}
+
+fn mark(annotation: &Annotation) -> Mark {
+    match annotation {
+        Annotation::Ink {
+            strokes,
+            color,
+            width,
+        } => Mark::Ink {
+            strokes: strokes
+                .iter()
+                .map(|s| s.iter().map(|p| (p.x, p.y)).collect())
+                .collect(),
+            color: *color,
+            width: *width,
+        },
+        Annotation::Highlight {
+            left,
+            top,
+            right,
+            bottom,
+            color,
+        } => Mark::Highlight {
+            left: *left,
+            top: *top,
+            right: *right,
+            bottom: *bottom,
+            color: *color,
+        },
+        Annotation::Text {
+            text,
+            x,
+            y,
+            size,
+            color,
+        } => Mark::Text {
+            text: text.clone(),
+            x: *x,
+            y: *y,
+            size: *size,
+            color: *color,
+        },
     }
 }

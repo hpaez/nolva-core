@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use document_engine::{
-    Crop, Document, DocumentError, DocumentId, DocumentService, FolderId, Page, PageFileStore,
-    PageId, PageText, PdfExportOptions, Rotation, SystemClock, TextBounds, TextLine,
+    Annotation, Crop, Document, DocumentError, DocumentId, DocumentService, FolderId, Page,
+    PageFileStore, PageId, PageText, PdfExportOptions, Point, Rotation, Signature, SignatureId,
+    SystemClock, TextBounds, TextLine,
 };
 use storage_engine::{DATABASE_FILE_NAME, LocalPageFileStore, SqliteDocumentRepository};
 
@@ -153,6 +154,47 @@ pub struct PageInfo {
 pub struct NormalizedPoint {
     pub x: f32,
     pub y: f32,
+}
+
+/// An annotation over a page, in normalized coordinates of the page image
+/// as displayed (`PageInfo.processed_path`, else the original). Stroke widths
+/// and text sizes are fractions of the image's shorter side. Colours are
+/// `0xRRGGBB`.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum PageAnnotation {
+    /// Pen strokes: handwriting or a placed signature.
+    Ink {
+        strokes: Vec<Vec<NormalizedPoint>>,
+        color: u32,
+        width: f32,
+    },
+    /// A translucent marker over a rectangle.
+    Highlight {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        color: u32,
+    },
+    /// Typed text, its first line's top left at (`x`, `y`); `\n` breaks lines.
+    Text {
+        text: String,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: u32,
+    },
+}
+
+/// A saved signature. Its strokes are in its own box, `0.0..=1.0` on both
+/// axes and `aspect_ratio` (width / height) wide: scale it into a box of
+/// that shape to place it.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SignatureInfo {
+    pub id: String,
+    pub strokes: Vec<Vec<NormalizedPoint>>,
+    pub aspect_ratio: f32,
+    pub created_at_ms: i64,
 }
 
 /// The four corners of a page outline.
@@ -339,12 +381,14 @@ impl From<DocumentError> for NolvaError {
             | DocumentError::InvalidCorners { .. }
             | DocumentError::InvalidRotation { .. }
             | DocumentError::InvalidPassword
+            | DocumentError::InvalidAnnotation { .. }
             | DocumentError::EmptyDocument(_)
             | DocumentError::InvalidText { .. } => Self::InvalidArgument { reason },
             DocumentError::PageImageChanged(_) => Self::Conflict { reason },
             DocumentError::DocumentNotFound(_)
             | DocumentError::PageNotFound(_)
             | DocumentError::FolderNotFound(_)
+            | DocumentError::SignatureNotFound(_)
             | DocumentError::SourceImageNotFound(_) => Self::NotFound { reason },
             DocumentError::UnsupportedImageFormat { .. } => Self::Unsupported { reason },
             DocumentError::Storage(_) => Self::Storage { reason },
@@ -635,6 +679,58 @@ impl NolvaCore {
         Ok(page_text_info(text))
     }
 
+    /// The page's annotations, bottom to top.
+    pub fn get_page_annotations(&self, page_id: String) -> Result<Vec<PageAnnotation>, NolvaError> {
+        let id: PageId = page_id.parse()?;
+        Ok(self
+            .service
+            .annotations(id)?
+            .into_iter()
+            .map(PageAnnotation::from)
+            .collect())
+    }
+
+    /// Replaces all of the page's annotations (the editor's result). Points a
+    /// little outside the page are pulled in; anything that can't be drawn,
+    /// or more than 500 annotations or 50 000 points, is `InvalidArgument`.
+    pub fn set_page_annotations(
+        &self,
+        page_id: String,
+        annotations: Vec<PageAnnotation>,
+    ) -> Result<(), NolvaError> {
+        let id: PageId = page_id.parse()?;
+        let annotations = annotations.into_iter().map(Annotation::from).collect();
+        Ok(self.service.set_annotations(id, annotations)?)
+    }
+
+    /// Saves a handwritten signature (at most 10 are kept).
+    pub fn save_signature(
+        &self,
+        strokes: Vec<Vec<NormalizedPoint>>,
+        aspect_ratio: f32,
+    ) -> Result<SignatureInfo, NolvaError> {
+        let signature = self
+            .service
+            .save_signature(strokes_from_ffi(strokes), aspect_ratio)?;
+        Ok(signature_info(signature))
+    }
+
+    /// Saved signatures, oldest first.
+    pub fn list_signatures(&self) -> Result<Vec<SignatureInfo>, NolvaError> {
+        Ok(self
+            .service
+            .list_signatures()?
+            .into_iter()
+            .map(signature_info)
+            .collect())
+    }
+
+    /// Forgets a saved signature; pages it was placed on keep it.
+    pub fn delete_signature(&self, signature_id: String) -> Result<(), NolvaError> {
+        let id: SignatureId = signature_id.parse()?;
+        Ok(self.service.delete_signature(id)?)
+    }
+
     /// The page's recognized text, or `None` while recognition is pending.
     pub fn get_page_text(&self, page_id: String) -> Result<Option<PageTextInfo>, NolvaError> {
         let id: PageId = page_id.parse()?;
@@ -796,6 +892,117 @@ impl NolvaCore {
             filter: page.filter.into(),
             rotation_degrees: page.rotation.degrees(),
             created_at_ms: page.created_at_ms,
+        }
+    }
+}
+
+fn strokes_from_ffi(strokes: Vec<Vec<NormalizedPoint>>) -> Vec<Vec<Point>> {
+    strokes
+        .into_iter()
+        .map(|s| s.into_iter().map(|p| Point::new(p.x, p.y)).collect())
+        .collect()
+}
+
+fn strokes_to_ffi(strokes: Vec<Vec<Point>>) -> Vec<Vec<NormalizedPoint>> {
+    strokes
+        .into_iter()
+        .map(|s| {
+            s.into_iter()
+                .map(|p| NormalizedPoint { x: p.x, y: p.y })
+                .collect()
+        })
+        .collect()
+}
+
+fn signature_info(signature: Signature) -> SignatureInfo {
+    SignatureInfo {
+        id: signature.id.to_string(),
+        strokes: strokes_to_ffi(signature.strokes),
+        aspect_ratio: signature.aspect_ratio,
+        created_at_ms: signature.created_at_ms,
+    }
+}
+
+impl From<PageAnnotation> for Annotation {
+    fn from(annotation: PageAnnotation) -> Self {
+        match annotation {
+            PageAnnotation::Ink {
+                strokes,
+                color,
+                width,
+            } => Self::Ink {
+                strokes: strokes_from_ffi(strokes),
+                color,
+                width,
+            },
+            PageAnnotation::Highlight {
+                left,
+                top,
+                right,
+                bottom,
+                color,
+            } => Self::Highlight {
+                left,
+                top,
+                right,
+                bottom,
+                color,
+            },
+            PageAnnotation::Text {
+                text,
+                x,
+                y,
+                size,
+                color,
+            } => Self::Text {
+                text,
+                x,
+                y,
+                size,
+                color,
+            },
+        }
+    }
+}
+
+impl From<Annotation> for PageAnnotation {
+    fn from(annotation: Annotation) -> Self {
+        match annotation {
+            Annotation::Ink {
+                strokes,
+                color,
+                width,
+            } => Self::Ink {
+                strokes: strokes_to_ffi(strokes),
+                color,
+                width,
+            },
+            Annotation::Highlight {
+                left,
+                top,
+                right,
+                bottom,
+                color,
+            } => Self::Highlight {
+                left,
+                top,
+                right,
+                bottom,
+                color,
+            },
+            Annotation::Text {
+                text,
+                x,
+                y,
+                size,
+                color,
+            } => Self::Text {
+                text,
+                x,
+                y,
+                size,
+                color,
+            },
         }
     }
 }
@@ -1198,6 +1405,85 @@ mod tests {
         drop(core);
         let reopened = super::tests::core(&data);
         assert_eq!(reopened.get_page(page.id).unwrap(), recropped);
+    }
+
+    #[test]
+    fn annotations_and_signatures_end_to_end() {
+        let data = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Firmado".into()).unwrap();
+        let page = core
+            .add_page(
+                doc.id.clone(),
+                photo_of_tilted_sheet(src.path()).to_string_lossy().into(),
+            )
+            .unwrap();
+        let point = |x, y| NormalizedPoint { x, y };
+
+        let signature = core
+            .save_signature(vec![vec![point(0.0, 0.7), point(1.0, 0.3)]], 3.0)
+            .unwrap();
+        assert_eq!(core.list_signatures().unwrap(), vec![signature.clone()]);
+
+        let annotations = vec![
+            PageAnnotation::Ink {
+                strokes: vec![vec![point(0.6, 0.8), point(0.9, 0.85)]],
+                color: 0x1A_4D_8F,
+                width: 0.004,
+            },
+            PageAnnotation::Text {
+                text: "Aprobado".into(),
+                x: 0.1,
+                y: 0.1,
+                size: 0.04,
+                color: 0,
+            },
+        ];
+        core.set_page_annotations(page.id.clone(), annotations.clone())
+            .unwrap();
+        assert_eq!(
+            core.get_page_annotations(page.id.clone()).unwrap(),
+            annotations
+        );
+        assert!(matches!(
+            core.set_page_annotations(
+                page.id.clone(),
+                vec![PageAnnotation::Ink {
+                    strokes: vec![],
+                    color: 0,
+                    width: 0.01
+                }]
+            ),
+            Err(NolvaError::InvalidArgument { .. })
+        ));
+
+        // Turning the page turns them; the PDF shows the text.
+        core.rotate_page(page.id.clone(), true).unwrap();
+        let PageAnnotation::Text { x, y, .. } =
+            &core.get_page_annotations(page.id.clone()).unwrap()[1]
+        else {
+            panic!("text expected")
+        };
+        assert!((x - 0.9).abs() < 1e-5 && (y - 0.1).abs() < 1e-5);
+        let output = src.path().join("firmado.pdf");
+        let options = PdfOptions {
+            paper_size: PaperSize::FitImage,
+            margin_mm: 0.0,
+            page_numbers: false,
+            password: None,
+        };
+        core.export_pdf(doc.id, output.to_string_lossy().into(), options)
+            .unwrap();
+        let pdf = lopdf::Document::load(&output).unwrap();
+        assert!(pdf.extract_text(&[1]).unwrap().contains("Aprobado"));
+
+        core.delete_signature(signature.id.clone()).unwrap();
+        assert!(core.list_signatures().unwrap().is_empty());
+        assert!(matches!(
+            core.delete_signature(signature.id),
+            Err(NolvaError::NotFound { .. })
+        ));
     }
 
     #[test]

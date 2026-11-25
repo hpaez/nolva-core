@@ -2,10 +2,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::annotation::{Annotation, Signature};
 use crate::error::{PortError, ProcessingError};
 use crate::model::{
     Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
-    Rotation,
+    Rotation, SignatureId,
 };
 use crate::text::{PageText, TextLine, TextMatch};
 
@@ -133,6 +134,26 @@ pub trait DocumentRepository: Send + Sync {
     /// first. `query` is user input, not search syntax. Trashed documents
     /// are left out.
     fn search_text(&self, query: &str, limit: u32) -> Result<Vec<TextMatch>, PortError>;
+
+    /// A page's annotations, bottom to top. Empty if it has none.
+    fn get_annotations(&self, page_id: PageId) -> Result<Vec<Annotation>, PortError>;
+
+    /// Replaces a page's annotations, atomically, and bumps its document's
+    /// `updated_at_ms`. Fails if the page doesn't exist.
+    fn set_annotations(
+        &self,
+        page_id: PageId,
+        annotations: &[Annotation],
+        updated_at_ms: i64,
+    ) -> Result<(), PortError>;
+
+    fn insert_signature(&self, signature: &Signature) -> Result<(), PortError>;
+
+    /// Saved signatures, oldest first.
+    fn list_signatures(&self) -> Result<Vec<Signature>, PortError>;
+
+    /// `false` if there was no such signature.
+    fn delete_signature(&self, id: SignatureId) -> Result<bool, PortError>;
 }
 
 /// What a cleanup of unreferenced files removed.
@@ -271,6 +292,8 @@ pub struct ExportPage {
     /// Absolute path of the image.
     pub image: PathBuf,
     pub text: Vec<TextLine>,
+    /// Drawn over the image, bottom to top.
+    pub annotations: Vec<Annotation>,
 }
 
 /// Turns page images into shareable files.

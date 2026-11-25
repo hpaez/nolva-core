@@ -74,6 +74,12 @@ pub enum DocumentError {
     #[error("invalid recognized text: {reason}")]
     InvalidText { reason: String },
 
+    #[error("invalid annotation: {reason}")]
+    InvalidAnnotation { reason: String },
+
+    #[error("signature not found: {0}")]
+    SignatureNotFound(crate::model::SignatureId),
+
     /// The page's image changed while its text was being recognized, so the
     /// result no longer applies. The page shows up again in
     /// `pages_needing_text`.

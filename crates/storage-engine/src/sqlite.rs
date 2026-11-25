@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use document_engine::{
-    Crop, Document, DocumentId, DocumentRepository, Folder, FolderId, NewPage, Page, PageFilter,
-    PageId, PageText, PortError, Rotation, TextBounds, TextLine, TextMatch,
+    Annotation, Crop, Document, DocumentId, DocumentRepository, Folder, FolderId, NewPage, Page,
+    PageFilter, PageId, PageText, Point, PortError, Rotation, Signature, SignatureId, TextBounds,
+    TextLine, TextMatch,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -182,6 +183,158 @@ fn renumber(tx: &Transaction<'_>, document_id: &str, order: &[String]) -> rusqli
         stmt.execute(params![id, position as i64])?;
     }
     Ok(())
+}
+
+/// An annotation as stored: see migration 8.
+struct AnnotationRow<'a> {
+    kind: &'static str,
+    color: u32,
+    size: f32,
+    geometry: String,
+    text: Option<&'a str>,
+}
+
+impl<'a> From<&'a Annotation> for AnnotationRow<'a> {
+    fn from(annotation: &'a Annotation) -> Self {
+        match annotation {
+            Annotation::Ink {
+                strokes,
+                color,
+                width,
+            } => Self {
+                kind: "ink",
+                color: *color,
+                size: *width,
+                geometry: strokes_to_db(strokes),
+                text: None,
+            },
+            Annotation::Highlight {
+                left,
+                top,
+                right,
+                bottom,
+                color,
+            } => Self {
+                kind: "highlight",
+                color: *color,
+                size: 0.0,
+                geometry: format!("{left},{top},{right},{bottom}"),
+                text: None,
+            },
+            Annotation::Text {
+                text,
+                x,
+                y,
+                size,
+                color,
+            } => Self {
+                kind: "text",
+                color: *color,
+                size: *size,
+                geometry: format!("{x},{y}"),
+                text: Some(text),
+            },
+        }
+    }
+}
+
+fn annotation_from_row(row: &Row<'_>) -> rusqlite::Result<Annotation> {
+    let kind: String = row.get(0)?;
+    let color: u32 = row.get(1)?;
+    let size: f32 = row.get(2)?;
+    let geometry: String = row.get(3)?;
+    let numbers = |expected: usize| -> rusqlite::Result<Vec<f32>> {
+        let values = floats(&geometry).map_err(|e| conversion_error(3, e))?;
+        if values.len() == expected {
+            Ok(values)
+        } else {
+            Err(conversion_error(
+                3,
+                format!("expected {expected} numbers: {geometry}"),
+            ))
+        }
+    };
+    Ok(match kind.as_str() {
+        "ink" => Annotation::Ink {
+            strokes: strokes_from_db(&geometry).map_err(|e| conversion_error(3, e))?,
+            color,
+            width: size,
+        },
+        "highlight" => {
+            let v = numbers(4)?;
+            Annotation::Highlight {
+                left: v[0],
+                top: v[1],
+                right: v[2],
+                bottom: v[3],
+                color,
+            }
+        }
+        "text" => {
+            let v = numbers(2)?;
+            Annotation::Text {
+                text: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                x: v[0],
+                y: v[1],
+                size,
+                color,
+            }
+        }
+        other => {
+            return Err(conversion_error(
+                0,
+                format!("unknown annotation kind: {other}"),
+            ));
+        }
+    })
+}
+
+/// Strokes as "x,y x,y;x,y". Rust's float `Display` round-trips exactly.
+fn strokes_to_db(strokes: &[Vec<Point>]) -> String {
+    strokes
+        .iter()
+        .map(|stroke| {
+            stroke
+                .iter()
+                .map(|p| format!("{},{}", p.x, p.y))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn strokes_from_db(value: &str) -> Result<Vec<Vec<Point>>, String> {
+    value
+        .split(';')
+        .map(|stroke| {
+            stroke
+                .split(' ')
+                .map(|pair| {
+                    let v = floats(pair)?;
+                    match v.as_slice() {
+                        [x, y] => Ok(Point::new(*x, *y)),
+                        _ => Err(format!("bad point: {pair}")),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn floats(value: &str) -> Result<Vec<f32>, String> {
+    value
+        .split(',')
+        .map(|v| v.parse::<f32>().map_err(|e| format!("{v}: {e}")))
+        .collect()
+}
+
+fn conversion_error(idx: usize, message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        idx,
+        rusqlite::types::Type::Text,
+        message.into().into(),
+    )
 }
 
 fn touch_document(
@@ -821,6 +974,114 @@ impl DocumentRepository for SqliteDocumentRepository {
         .and_then(Iterator::collect)
         .map_err(|e| PortError::new("search text", e))
     }
+
+    fn get_annotations(&self, page_id: PageId) -> Result<Vec<Annotation>, PortError> {
+        let ctx = "get annotations";
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, color, size, geometry, text FROM page_annotations
+                 WHERE page_id = ?1 ORDER BY position",
+            )
+            .map_err(|e| PortError::new(ctx, e))?;
+        stmt.query_map(params![page_id.to_string()], annotation_from_row)
+            .and_then(Iterator::collect)
+            .map_err(|e| PortError::new(ctx, e))
+    }
+
+    fn set_annotations(
+        &self,
+        page_id: PageId,
+        annotations: &[Annotation],
+        updated_at_ms: i64,
+    ) -> Result<(), PortError> {
+        let ctx = "set annotations";
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| PortError::new(ctx, e))?;
+        let document_id = page_document(&tx, page_id)
+            .map_err(|e| PortError::new(ctx, e))?
+            .ok_or_else(|| PortError::new(ctx, format!("page not found: {page_id}")))?;
+        let id = page_id.to_string();
+        tx.execute(
+            "DELETE FROM page_annotations WHERE page_id = ?1",
+            params![id],
+        )
+        .map_err(|e| PortError::new(ctx, e))?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO page_annotations (page_id, position, kind, color, size, geometry, text)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| PortError::new(ctx, e))?;
+            for (position, annotation) in annotations.iter().enumerate() {
+                let row = AnnotationRow::from(annotation);
+                insert
+                    .execute(params![
+                        id,
+                        position as i64,
+                        row.kind,
+                        row.color,
+                        row.size,
+                        row.geometry,
+                        row.text
+                    ])
+                    .map_err(|e| PortError::new(ctx, e))?;
+            }
+        }
+        touch_document(&tx, &document_id, updated_at_ms).map_err(|e| PortError::new(ctx, e))?;
+        tx.commit().map_err(|e| PortError::new(ctx, e))
+    }
+
+    fn insert_signature(&self, signature: &Signature) -> Result<(), PortError> {
+        self.conn()
+            .execute(
+                "INSERT INTO signatures (id, strokes, aspect_ratio, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    signature.id.to_string(),
+                    strokes_to_db(&signature.strokes),
+                    signature.aspect_ratio,
+                    signature.created_at_ms
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| PortError::new("insert signature", e))
+    }
+
+    fn list_signatures(&self) -> Result<Vec<Signature>, PortError> {
+        let ctx = "list signatures";
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, strokes, aspect_ratio, created_at_ms FROM signatures
+                 ORDER BY created_at_ms, id",
+            )
+            .map_err(|e| PortError::new(ctx, e))?;
+        stmt.query_map([], |row| {
+            let strokes: String = row.get(1)?;
+            Ok(Signature {
+                id: parse_id(row, 0)?,
+                strokes: strokes_from_db(&strokes).map_err(|e| conversion_error(1, e))?,
+                aspect_ratio: row.get(2)?,
+                created_at_ms: row.get(3)?,
+            })
+        })
+        .and_then(Iterator::collect)
+        .map_err(|e| PortError::new(ctx, e))
+    }
+
+    fn delete_signature(&self, id: SignatureId) -> Result<bool, PortError> {
+        self.conn()
+            .execute(
+                "DELETE FROM signatures WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .map(|n| n > 0)
+            .map_err(|e| PortError::new("delete signature", e))
+    }
 }
 
 #[cfg(test)]
@@ -1210,6 +1471,73 @@ mod tests {
             updated_at_ms: 1,
             document_count: 0,
         }
+    }
+
+    #[test]
+    fn annotations_round_trip_in_order_and_go_with_their_page() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let page = repo.append_page(&new_page(d.id, 2)).unwrap();
+        let annotations = vec![
+            Annotation::Highlight {
+                left: 0.1,
+                top: 1.0 / 3.0,
+                right: 0.9,
+                bottom: 0.4,
+                color: 0xFF_EB_3B,
+            },
+            Annotation::Ink {
+                strokes: vec![
+                    vec![Point::new(0.123_456_79, 0.2), Point::new(0.3, 0.4)],
+                    vec![Point::new(0.5, 0.6)],
+                ],
+                color: 0x1A_4D_8F,
+                width: 0.004,
+            },
+            Annotation::Text {
+                text: "Recibido, 3/2026;\nfirma: ñandú".into(),
+                x: 0.05,
+                y: 0.9,
+                size: 0.03,
+                color: 0,
+            },
+        ];
+
+        repo.set_annotations(page.id, &annotations, 7).unwrap();
+
+        assert_eq!(repo.get_annotations(page.id).unwrap(), annotations);
+        assert_eq!(repo.get_document(d.id).unwrap().unwrap().updated_at_ms, 7);
+        // Replacing keeps only the new set.
+        repo.set_annotations(page.id, &annotations[1..2], 8)
+            .unwrap();
+        assert_eq!(repo.get_annotations(page.id).unwrap(), &annotations[1..2]);
+        assert!(
+            repo.set_annotations(PageId::new(), &annotations, 9)
+                .is_err()
+        );
+
+        repo.delete_page(page.id, 10).unwrap();
+        assert!(repo.get_annotations(page.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn signatures_round_trip_oldest_first() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let signature = |at: i64| Signature {
+            id: SignatureId::new(),
+            strokes: vec![vec![Point::new(0.0, 0.5), Point::new(1.0, 0.25)]],
+            aspect_ratio: 3.2,
+            created_at_ms: at,
+        };
+        let (newer, older) = (signature(20), signature(10));
+        repo.insert_signature(&newer).unwrap();
+        repo.insert_signature(&older).unwrap();
+
+        assert_eq!(repo.list_signatures().unwrap(), vec![older.clone(), newer]);
+        assert!(repo.delete_signature(older.id).unwrap());
+        assert!(!repo.delete_signature(older.id).unwrap());
+        assert_eq!(repo.list_signatures().unwrap().len(), 1);
     }
 
     #[test]
