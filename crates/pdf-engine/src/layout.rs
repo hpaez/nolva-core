@@ -21,7 +21,7 @@ impl PageSize {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PdfOptions {
     pub page_size: PageSize,
     /// White margin around the image on fixed-size pages, in millimetres.
@@ -29,6 +29,21 @@ pub struct PdfOptions {
     /// Print "n / total" at the bottom centre of each page. Off by default:
     /// the PDF looks exactly like the scans unless asked otherwise.
     pub page_numbers: bool,
+    /// Password needed to open the PDF (AES-256), or `None` for an open
+    /// file. 1 to 127 bytes of UTF-8.
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for PdfOptions {
+    // Never print the password, e.g. in logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PdfOptions")
+            .field("page_size", &self.page_size)
+            .field("margin_mm", &self.margin_mm)
+            .field("page_numbers", &self.page_numbers)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 impl Default for PdfOptions {
@@ -37,6 +52,7 @@ impl Default for PdfOptions {
             page_size: PageSize::A4,
             margin_mm: 0.0,
             page_numbers: false,
+            password: None,
         }
     }
 }
@@ -107,6 +123,7 @@ mod tests {
             page_size: PageSize::FitImage,
             margin_mm: 10.0,
             page_numbers: false,
+            password: None,
         };
         let (w, h, p) = place(&options, 1000, 2000);
         assert!(approx(w, A4_WIDTH) && approx(h, A4_WIDTH * 2.0));
@@ -125,6 +142,7 @@ mod tests {
             page_size: PageSize::Letter,
             margin_mm: 25.4,
             page_numbers: false,
+            password: None,
         }; // 1 inch
         let (w, h, p) = place(&options, 1000, 1000);
         assert_eq!((w, h), (612.0, 792.0));

@@ -10,7 +10,8 @@ use crate::model::{
 };
 use crate::ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
-    ExportPage, ExportSummary, PageFileStore, PageProcessor, PdfExportOptions,
+    ExportPage, ExportSummary, MAX_PDF_PASSWORD_BYTES, PageFileStore, PageProcessor,
+    PdfExportOptions,
 };
 use crate::text::{PageText, TextLine, TextMatch, normalize_lines};
 
@@ -603,6 +604,13 @@ where
         output: &Path,
         options: &PdfExportOptions,
     ) -> Result<ExportSummary, DocumentError> {
+        if options
+            .password
+            .as_ref()
+            .is_some_and(|p| p.is_empty() || p.len() > MAX_PDF_PASSWORD_BYTES)
+        {
+            return Err(DocumentError::InvalidPassword);
+        }
         let (title, pages, _) = self.export_pages(document_id)?;
         self.exporter
             .export_pdf(&title, &pages, options, output)
@@ -1434,6 +1442,7 @@ mod tests {
         paper_size: crate::ports::PaperSize::A4,
         margin_mm: 0.0,
         page_numbers: false,
+        password: None,
     };
 
     #[test]

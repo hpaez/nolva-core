@@ -218,7 +218,7 @@ pub enum PaperSize {
     Legal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[derive(Clone, PartialEq, uniffi::Record)]
 pub struct PdfOptions {
     pub paper_size: PaperSize,
     /// White margin around each image on fixed-size pages, in millimetres.
@@ -226,6 +226,22 @@ pub struct PdfOptions {
     /// Print "n / total" at the bottom centre of each page. Off unless asked.
     #[uniffi(default = false)]
     pub page_numbers: bool,
+    /// Password needed to open the PDF (AES-256), or none. 1 to 127 bytes
+    /// of UTF-8; anything else is `InvalidArgument`.
+    #[uniffi(default = None)]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for PdfOptions {
+    // Never print the password, e.g. in logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PdfOptions")
+            .field("paper_size", &self.paper_size)
+            .field("margin_mm", &self.margin_mm)
+            .field("page_numbers", &self.page_numbers)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
@@ -322,6 +338,7 @@ impl From<DocumentError> for NolvaError {
             | DocumentError::InvalidId { .. }
             | DocumentError::InvalidCorners { .. }
             | DocumentError::InvalidRotation { .. }
+            | DocumentError::InvalidPassword
             | DocumentError::EmptyDocument(_)
             | DocumentError::InvalidText { .. } => Self::InvalidArgument { reason },
             DocumentError::PageImageChanged(_) => Self::Conflict { reason },
@@ -567,6 +584,7 @@ impl NolvaCore {
             },
             margin_mm: options.margin_mm,
             page_numbers: options.page_numbers,
+            password: options.password,
         };
         let summary = self.service.export_pdf(id, &output, &options)?;
         Ok(PdfExportInfo {
@@ -1280,6 +1298,7 @@ mod tests {
             paper_size: PaperSize::A4,
             margin_mm: 0.0,
             page_numbers: false,
+            password: None,
         };
         assert_eq!(
             core.export_pdf(doc.id, pdf.to_string_lossy().into(), options)
@@ -1343,6 +1362,7 @@ mod tests {
         core.crop_page(first.id, corners).unwrap();
         let output = src.path().join("contrato.pdf");
 
+        let doc_id = doc.id.clone();
         let info = core
             .export_pdf(
                 doc.id,
@@ -1351,6 +1371,7 @@ mod tests {
                     paper_size: PaperSize::A4,
                     margin_mm: 5.0,
                     page_numbers: false,
+                    password: None,
                 },
             )
             .unwrap();
@@ -1358,6 +1379,43 @@ mod tests {
         assert_eq!(info.page_count, 2);
         let pdf = lopdf::Document::load(&output).unwrap();
         assert_eq!(pdf.get_pages().len(), 2);
+        assert!(!pdf.is_encrypted());
+
+        // The same document, password protected.
+        let locked = src.path().join("contrato-clave.pdf");
+        let options = PdfOptions {
+            paper_size: PaperSize::A4,
+            margin_mm: 0.0,
+            page_numbers: true,
+            password: Some("1234".into()),
+        };
+        core.export_pdf(doc_id, locked.to_string_lossy().into(), options)
+            .unwrap();
+        let pdf = lopdf::Document::load(&locked).unwrap();
+        assert!(pdf.is_encrypted());
+        assert!(pdf.authenticate_user_password("1234").is_ok());
+        assert!(pdf.authenticate_user_password("4321").is_err());
+    }
+
+    #[test]
+    fn invalid_pdf_passwords_are_invalid_arguments() {
+        let data = tempfile::tempdir().unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Vacío".into()).unwrap();
+        let output = data.path().join("x.pdf").to_string_lossy().into_owned();
+        for password in [String::new(), "ñ".repeat(64)] {
+            let options = PdfOptions {
+                paper_size: PaperSize::A4,
+                margin_mm: 0.0,
+                page_numbers: false,
+                password: Some(password),
+            };
+            // Checked before anything else, even before the missing pages.
+            assert!(matches!(
+                core.export_pdf(doc.id.clone(), output.clone(), options),
+                Err(NolvaError::InvalidArgument { reason }) if reason.contains("password")
+            ));
+        }
     }
 
     #[test]
@@ -1370,10 +1428,11 @@ mod tests {
             paper_size: PaperSize::FitImage,
             margin_mm: 0.0,
             page_numbers: false,
+            password: None,
         };
 
         assert!(matches!(
-            core.export_pdf(doc.id.clone(), output, options),
+            core.export_pdf(doc.id.clone(), output, options.clone()),
             Err(NolvaError::InvalidArgument { .. })
         ));
         assert!(matches!(

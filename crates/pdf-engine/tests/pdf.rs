@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{GrayImage, Luma, Rgb, RgbImage};
-use lopdf::{Document, Object, ObjectId};
+use lopdf::{Document, LoadOptions, Object, ObjectId};
 use pdf_engine::{PageSize, PdfError, PdfOptions, PdfPage, TextBox, write_pdf};
 
 fn write_jpeg(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
@@ -188,6 +188,7 @@ fn fit_image_pages_follow_the_image_shape() {
         page_size: PageSize::FitImage,
         margin_mm: 0.0,
         page_numbers: false,
+        password: None,
     };
 
     write_pdf("x", &image_pages(&[receipt]), &options, &output).unwrap();
@@ -360,4 +361,93 @@ fn page_numbers_stay_visible_after_an_invisible_text_layer() {
     let visible = content.rfind("0 Tr").unwrap();
     assert!(visible > invisible, "{content}");
     assert_eq!(doc.get_page_fonts(id).unwrap().len(), 2);
+}
+
+fn protected(password: &str) -> PdfOptions {
+    PdfOptions {
+        password: Some(password.into()),
+        ..PdfOptions::default()
+    }
+}
+
+#[test]
+fn password_protected_pdfs_open_only_with_the_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    let jpeg = write_jpeg(dir.path(), "a.jpg", 600, 800);
+    let pages = vec![PdfPage {
+        image: jpeg.clone(),
+        text: vec![TextBox {
+            text: "Total: $5.990".into(),
+            left: 0.1,
+            top: 0.1,
+            right: 0.9,
+            bottom: 0.15,
+        }],
+    }];
+    let options = PdfOptions {
+        page_numbers: true,
+        ..protected("contraseña 123")
+    };
+
+    write_pdf("Factura ñandú", &pages, &options, &output).unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    // Nothing readable without the password: not the text, title or image.
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(
+        !raw.contains("5.990") && !raw.contains("Factura"),
+        "plain text leaked"
+    );
+    let jpeg_bytes = fs::read(&jpeg).unwrap();
+    assert!(
+        !bytes.windows(64).any(|w| w == &jpeg_bytes[..64]),
+        "image stored in the clear"
+    );
+
+    let locked = Document::load(&output).unwrap();
+    assert!(locked.is_encrypted());
+    assert!(locked.authenticate_user_password("contraseña").is_err());
+    assert!(locked.authenticate_user_password("").is_err());
+    locked.authenticate_user_password("contraseña 123").unwrap();
+    let with =
+        |password: &str| Document::load_with_options(&output, LoadOptions::with_password(password));
+    assert!(with("contraseña").is_err());
+    let doc = with("contraseña 123").unwrap();
+
+    let info_ref = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+    let title = doc.get_dictionary(info_ref).unwrap().get(b"Title").unwrap();
+    assert_eq!(lopdf::decode_text_string(title).unwrap(), "Factura ñandú");
+    let text = doc.extract_text(&[1]).unwrap();
+    assert!(
+        text.contains("Total: $5.990") && text.contains("1 / 1"),
+        "{text:?}"
+    );
+    // The scan comes back byte for byte.
+    let page = *doc.get_pages().values().next().unwrap();
+    let image = doc.get_page_images(page).unwrap().remove(0);
+    assert_eq!(image.content, &jpeg_bytes[..]);
+}
+
+#[test]
+fn rejects_empty_or_too_long_passwords() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    let pages = image_pages(&[write_jpeg(dir.path(), "a.jpg", 10, 10)]);
+
+    for password in [String::new(), "x".repeat(128)] {
+        let err = write_pdf("x", &pages, &protected(&password), &output).unwrap_err();
+        assert!(matches!(err, PdfError::InvalidPassword), "{err:?}");
+        assert!(!output.exists());
+    }
+    write_pdf("x", &pages, &protected(&"x".repeat(127)), &output).unwrap();
+}
+
+#[test]
+fn options_never_print_the_password() {
+    let debug = format!("{:?}", protected("secreto"));
+    assert!(
+        !debug.contains("secreto") && debug.contains("***"),
+        "{debug}"
+    );
 }
