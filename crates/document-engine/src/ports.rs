@@ -226,13 +226,30 @@ pub enum PaperSize {
     Legal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PdfExportOptions {
     pub paper_size: PaperSize,
     /// White margin on fixed-size pages, in millimetres.
     pub margin_mm: f32,
     /// Print "n / total" at the bottom of each page.
     pub page_numbers: bool,
+    /// Password needed to open the PDF, or `None`. See [`MAX_PDF_PASSWORD_BYTES`].
+    pub password: Option<String>,
+}
+
+/// Longest PDF password, in UTF-8 bytes: what PDF readers compare (ISO 32000-2).
+pub const MAX_PDF_PASSWORD_BYTES: usize = 127;
+
+impl std::fmt::Debug for PdfExportOptions {
+    // Never print the password, e.g. in logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PdfExportOptions")
+            .field("paper_size", &self.paper_size)
+            .field("margin_mm", &self.margin_mm)
+            .field("page_numbers", &self.page_numbers)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

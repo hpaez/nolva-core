@@ -59,6 +59,9 @@ pub enum DocumentError {
     #[error("invalid rotation: {degrees}° (use 0, 90, 180 or 270)")]
     InvalidRotation { degrees: u32 },
 
+    #[error("invalid PDF password: use 1 to {max} bytes", max = crate::MAX_PDF_PASSWORD_BYTES)]
+    InvalidPassword,
+
     #[error("document has no pages: {0}")]
     EmptyDocument(DocumentId),
 

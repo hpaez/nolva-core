@@ -106,6 +106,7 @@ impl DocumentExporter for PdfDocumentExporter {
             },
             margin_mm: options.margin_mm,
             page_numbers: options.page_numbers,
+            password: options.password.clone(),
         };
         let pages: Vec<PdfPage> = pages
             .iter()

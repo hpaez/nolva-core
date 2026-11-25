@@ -1,6 +1,7 @@
 //! PDF generation: one page per image, in order, optionally with the
 //! page's recognized text as an invisible, selectable layer (see [`TextBox`])
-//! and, if asked, page numbers (see [`PdfOptions::page_numbers`]).
+//! and, if asked, page numbers (see [`PdfOptions::page_numbers`]) and a
+//! password (see [`PdfOptions::password`]).
 //!
 //! JPEGs that are already upright are embedded byte for byte (PDF supports
 //! JPEG natively via `DCTDecode`), so exporting never loses quality and is
@@ -9,6 +10,7 @@
 //! ignore EXIF orientation.
 
 mod embed;
+mod encrypt;
 mod layout;
 mod numbers;
 mod text;
@@ -17,7 +19,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, TextStr};
+use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
 pub use layout::{PageSize, PdfOptions};
 pub use text::TextBox;
@@ -45,6 +47,12 @@ pub enum PdfError {
     #[error("unsupported image format: {}", .0.display())]
     UnsupportedFormat(PathBuf),
 
+    #[error("the password must be 1 to {max} bytes", max = encrypt::MAX_PASSWORD_BYTES)]
+    InvalidPassword,
+
+    #[error("no secure random numbers for encryption: {0}")]
+    Random(getrandom::Error),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -65,6 +73,13 @@ pub fn write_pdf(
 ) -> Result<PdfSummary, PdfError> {
     if pages.is_empty() {
         return Err(PdfError::NoPages);
+    }
+    if options
+        .password
+        .as_deref()
+        .is_some_and(|p| !valid_password(p))
+    {
+        return Err(PdfError::InvalidPassword);
     }
 
     let bytes = build_pdf(title, pages, options)?;
@@ -90,6 +105,11 @@ pub fn write_pdf(
     })
 }
 
+/// Whether `password` can protect a PDF: not empty, at most 127 bytes.
+pub fn valid_password(password: &str) -> bool {
+    (1..=encrypt::MAX_PASSWORD_BYTES).contains(&password.len())
+}
+
 fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec<u8>, PdfError> {
     let mut pdf = Pdf::new();
     let mut next_id = Ref::new(1);
@@ -99,14 +119,36 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
     let tree_id = alloc();
     let info_id = alloc();
 
+    let encryption = options
+        .password
+        .as_deref()
+        .map(encrypt::Encryption::new)
+        .transpose()
+        .map_err(PdfError::Random)?;
+    // Streams and strings go through this: encrypted when there's a password.
+    let seal = |data: &[u8]| -> Result<Vec<u8>, PdfError> {
+        match &encryption {
+            Some(enc) => enc.encrypt(data).map_err(PdfError::Random),
+            None => Ok(data.to_vec()),
+        }
+    };
+
     let page_ids: Vec<Ref> = pages.iter().map(|_| alloc()).collect();
     pdf.catalog(catalog_id).pages(tree_id);
     pdf.pages(tree_id)
         .kids(page_ids.iter().copied())
         .count(page_ids.len() as i32);
-    pdf.document_info(info_id)
-        .title(TextStr(title))
-        .producer(TextStr("Nolva"));
+    if encryption.is_some() {
+        let title = seal(&encrypt::text_string(title))?;
+        let producer = seal(&encrypt::text_string("Nolva"))?;
+        let mut info = pdf.document_info(info_id);
+        info.pair(Name(b"Title"), Str(&title));
+        info.pair(Name(b"Producer"), Str(&producer));
+    } else {
+        pdf.document_info(info_id)
+            .title(TextStr(title))
+            .producer(TextStr("Nolva"));
+    }
 
     // One font for every page's text layer, written only if some page has text.
     let has_text = pages.iter().any(|p| !p.text.is_empty());
@@ -139,7 +181,8 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         let image_id = alloc();
         let content_id = alloc();
 
-        let mut image = pdf.image_xobject(image_id, &embedded.bytes);
+        let image_data = seal(&embedded.bytes)?;
+        let mut image = pdf.image_xobject(image_id, &image_data);
         image.filter(pdf_writer::Filter::DctDecode);
         image.width(embedded.width as i32);
         image.height(embedded.height as i32);
@@ -172,7 +215,7 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
                 page_w,
             );
         }
-        pdf.stream(content_id, &content.finish());
+        pdf.stream(content_id, &seal(&content.finish())?);
 
         let mut page = pdf.page(page_id);
         page.media_box(Rect::new(0.0, 0.0, page_w, page_h));
@@ -194,5 +237,18 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         page.finish();
     }
 
-    Ok(pdf.finish())
+    let Some(encryption) = encryption else {
+        return Ok(pdf.finish());
+    };
+    let encrypt_id = alloc();
+    encryption.write_dict(&mut pdf.indirect(encrypt_id).dict());
+    // Encrypted files must carry an ID; it is never encrypted.
+    let mut file_id = vec![0u8; 16];
+    getrandom::fill(&mut file_id).map_err(PdfError::Random)?;
+    pdf.set_file_id((file_id.clone(), file_id));
+    let mut bytes = pdf.finish();
+    if !encrypt::link_trailer(&mut bytes, encrypt_id.get()) {
+        return Err(PdfError::Io(std::io::Error::other("PDF trailer not found")));
+    }
+    Ok(bytes)
 }

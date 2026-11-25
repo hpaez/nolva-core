@@ -20,7 +20,8 @@ pub use model::{
 };
 pub use ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
-    ExportPage, ExportSummary, PageFileStore, PageProcessor, PaperSize, PdfExportOptions,
+    ExportPage, ExportSummary, MAX_PDF_PASSWORD_BYTES, PageFileStore, PageProcessor, PaperSize,
+    PdfExportOptions,
 };
 pub use service::{
     DocumentService, DocxExport, MAX_SEARCH_RESULTS, MAX_TITLE_CHARS, ORPHAN_GRACE,
