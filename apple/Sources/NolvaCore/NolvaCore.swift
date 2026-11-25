@@ -481,6 +481,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
     typealias FfiType = Int64
     typealias SwiftType = Int64
@@ -490,6 +506,46 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
     }
 
     public static func write(_ value: Int64, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -540,6 +596,24 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterData: FfiConverterRustBuffer {
+    typealias SwiftType = Data
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        let len: Int32 = try readInt(&buf)
+        return Data(try readBytes(&buf, count: Int(len)))
+    }
+
+    public static func write(_ value: Data, into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        writeBytes(&buf, value)
+    }
+}
+
 
 
 
@@ -556,9 +630,177 @@ public protocol NolvaCoreProtocol: AnyObject, Sendable {
     
     func createDocument(title: String) throws  -> DocumentInfo
     
+    /**
+     * Creates an empty document in a folder (`None`: the top level).
+     */
+    func createDocumentInFolder(title: String, folderId: String?) throws  -> DocumentInfo
+    
+    /**
+     * Creates a folder. Names follow the same rules as document titles.
+     */
+    func createFolder(name: String) throws  -> FolderInfo
+    
+    /**
+     * Crops and straightens the page to `corners`, storing the result as
+     * the page's processed image. Can be called again to re-crop; the
+     * original is never modified. CPU-heavy: call off the main thread.
+     */
+    func cropPage(pageId: String, corners: PageCorners) throws  -> PageInfo
+    
+    /**
+     * Permanently deletes a document, its pages and all their images.
+     */
+    func deleteDocument(documentId: String) throws 
+    
+    /**
+     * Deletes a folder. Its documents are kept and move to the top level.
+     */
+    func deleteFolder(folderId: String) throws 
+    
+    /**
+     * Permanently deletes a page and its images; later pages move up.
+     */
+    func deletePage(pageId: String) throws 
+    
+    /**
+     * Finds the page outline in the page's original photo. Returns `None`
+     * when nothing document-like is found (start the editor at the full
+     * image). CPU-heavy: call off the main thread.
+     */
+    func detectPageCorners(pageId: String) throws  -> CornerDetection?
+    
+    /**
+     * Copies a document, with its pages, crops, filters and recognized
+     * text, under `title` (the app supplies it, e.g. "Contrato (copia)").
+     */
+    func duplicateDocument(documentId: String, title: String) throws  -> DocumentInfo
+    
+    /**
+     * Permanently deletes every trashed document. Returns how many.
+     */
+    func emptyTrash() throws  -> UInt32
+    
+    /**
+     * Writes the document as an editable Word file to `output_path`
+     * (absolute; its folder must exist): the pages' recognized text as
+     * paragraphs, one Word page per page. Recognize pending pages first
+     * (see [`Self::pages_needing_text`]); any left are reported in
+     * `pages_pending_text` and come out empty. Call off the main thread.
+     */
+    func exportDocx(documentId: String, outputPath: String, options: DocxOptions) throws  -> DocxExportInfo
+    
+    /**
+     * Writes the document as a PDF to `output_path` (absolute; its folder
+     * must exist), one page per page, preferring cropped images. The file
+     * appears only once complete. Call off the main thread.
+     */
+    func exportPdf(documentId: String, outputPath: String, options: PdfOptions) throws  -> PdfExportInfo
+    
+    func getPage(pageId: String) throws  -> PageInfo
+    
+    /**
+     * The page's recognized text, or `None` while recognition is pending.
+     */
+    func getPageText(pageId: String) throws  -> PageTextInfo?
+    
     func listDocuments() throws  -> [DocumentInfo]
     
+    /**
+     * All folders, by name (ignoring case), with their document counts.
+     */
+    func listFolders() throws  -> [FolderInfo]
+    
     func listPages(documentId: String) throws  -> [PageInfo]
+    
+    /**
+     * Documents in the trash, most recently trashed first.
+     */
+    func listTrashedDocuments() throws  -> [DocumentInfo]
+    
+    /**
+     * Moves a document to the trash. It leaves `list_documents`, search
+     * and text recognition, and is deleted for good after 30 days unless
+     * restored.
+     */
+    func moveDocumentToTrash(documentId: String) throws 
+    
+    /**
+     * Moves documents into a folder (`None`: the top level), atomically.
+     * Returns how many moved; ids that no longer exist are skipped.
+     */
+    func moveDocuments(documentIds: [String], folderId: String?) throws  -> UInt32
+    
+    /**
+     * Moves a page to `to_position` (0-based; past the end means last) and
+     * returns the document's pages in their new order.
+     */
+    func movePage(pageId: String, toPosition: UInt32) throws  -> [PageInfo]
+    
+    /**
+     * Up to `limit` pages whose text still has to be recognized, newest
+     * first: new pages and pages whose image changed since. Recognize each
+     * one's displayed image (`processed_path`, else `original_path`) and
+     * pass the result to [`Self::save_page_text`].
+     */
+    func pagesNeedingText(limit: UInt32) throws  -> [PageInfo]
+    
+    /**
+     * Permanently deletes documents trashed more than 30 days ago. Returns
+     * how many. Run it with the other maintenance, e.g. once per app start.
+     */
+    func purgeExpiredTrash() throws  -> UInt32
+    
+    /**
+     * Deletes stored images that no page points to anymore (leftovers of
+     * failed deletions or interrupted imports). Files from the last hour are
+     * kept, so it is safe while the app is in use. Run it in the background,
+     * e.g. once per app start; it walks every stored file.
+     */
+    func removeOrphanFiles() throws  -> CleanupInfo
+    
+    func renameDocument(documentId: String, title: String) throws  -> DocumentInfo
+    
+    func renameFolder(folderId: String, name: String) throws  -> FolderInfo
+    
+    /**
+     * Takes a document out of the trash, as it was.
+     */
+    func restoreDocument(documentId: String) throws  -> DocumentInfo
+    
+    /**
+     * Turns the page a quarter, keeping its crop and filter. The original
+     * is never modified.
+     */
+    func rotatePage(pageId: String, clockwise: Bool) throws  -> PageInfo
+    
+    /**
+     * Stores the text recognized in `image_path`, the page's displayed
+     * image as [`PageInfo`] gave it. Fails with `Conflict` if the page
+     * shows another image by now (it was re-cropped meanwhile): drop the
+     * result, the page is pending again. Lines in reading order; blank
+     * lines are dropped and boxes are clamped into the image.
+     */
+    func savePageText(pageId: String, imagePath: String, lines: [RecognizedLine]) throws  -> PageTextInfo
+    
+    /**
+     * Pages whose text contains every word of `query` (as typed by the
+     * user; prefixes match, case and accents are ignored), best first, at
+     * most 50.
+     */
+    func searchText(query: String) throws  -> [TextSearchHit]
+    
+    /**
+     * Applies `filter` to the page, on top of its crop if it has one.
+     * CPU-heavy (up to about a second for a 12 MP photo): call it off the
+     * main thread.
+     */
+    func setPageFilter(pageId: String, filter: PageFilter) throws  -> PageInfo
+    
+    /**
+     * Sets crop, filter and rotation at once, e.g. to undo or redo an edit.
+     * Nothing is rendered if the page already looks like that.
+     */
+    func setPageRendering(pageId: String, corners: PageCorners?, filter: PageFilter, rotationDegrees: UInt32) throws  -> PageInfo
     
 }
 /**
@@ -651,10 +893,202 @@ open func createDocument(title: String)throws  -> DocumentInfo  {
 })
 }
     
+    /**
+     * Creates an empty document in a folder (`None`: the top level).
+     */
+open func createDocumentInFolder(title: String, folderId: String?)throws  -> DocumentInfo  {
+    return try  FfiConverterTypeDocumentInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_create_document_in_folder(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(title),
+        FfiConverterOptionString.lower(folderId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Creates a folder. Names follow the same rules as document titles.
+     */
+open func createFolder(name: String)throws  -> FolderInfo  {
+    return try  FfiConverterTypeFolderInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_create_folder(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Crops and straightens the page to `corners`, storing the result as
+     * the page's processed image. Can be called again to re-crop; the
+     * original is never modified. CPU-heavy: call off the main thread.
+     */
+open func cropPage(pageId: String, corners: PageCorners)throws  -> PageInfo  {
+    return try  FfiConverterTypePageInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_crop_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),
+        FfiConverterTypePageCorners_lower(corners),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Permanently deletes a document, its pages and all their images.
+     */
+open func deleteDocument(documentId: String)throws   {try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_delete_document(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(documentId),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Deletes a folder. Its documents are kept and move to the top level.
+     */
+open func deleteFolder(folderId: String)throws   {try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_delete_folder(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(folderId),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Permanently deletes a page and its images; later pages move up.
+     */
+open func deletePage(pageId: String)throws   {try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_delete_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Finds the page outline in the page's original photo. Returns `None`
+     * when nothing document-like is found (start the editor at the full
+     * image). CPU-heavy: call off the main thread.
+     */
+open func detectPageCorners(pageId: String)throws  -> CornerDetection?  {
+    return try  FfiConverterOptionTypeCornerDetection.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_detect_page_corners(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Copies a document, with its pages, crops, filters and recognized
+     * text, under `title` (the app supplies it, e.g. "Contrato (copia)").
+     */
+open func duplicateDocument(documentId: String, title: String)throws  -> DocumentInfo  {
+    return try  FfiConverterTypeDocumentInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_duplicate_document(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(documentId),
+        FfiConverterString.lower(title),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Permanently deletes every trashed document. Returns how many.
+     */
+open func emptyTrash()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_empty_trash(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Writes the document as an editable Word file to `output_path`
+     * (absolute; its folder must exist): the pages' recognized text as
+     * paragraphs, one Word page per page. Recognize pending pages first
+     * (see [`Self::pages_needing_text`]); any left are reported in
+     * `pages_pending_text` and come out empty. Call off the main thread.
+     */
+open func exportDocx(documentId: String, outputPath: String, options: DocxOptions)throws  -> DocxExportInfo  {
+    return try  FfiConverterTypeDocxExportInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_export_docx(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(documentId),
+        FfiConverterString.lower(outputPath),
+        FfiConverterTypeDocxOptions_lower(options),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Writes the document as a PDF to `output_path` (absolute; its folder
+     * must exist), one page per page, preferring cropped images. The file
+     * appears only once complete. Call off the main thread.
+     */
+open func exportPdf(documentId: String, outputPath: String, options: PdfOptions)throws  -> PdfExportInfo  {
+    return try  FfiConverterTypePdfExportInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_export_pdf(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(documentId),
+        FfiConverterString.lower(outputPath),
+        FfiConverterTypePdfOptions_lower(options),uniffiCallStatus
+    )
+})
+}
+    
+open func getPage(pageId: String)throws  -> PageInfo  {
+    return try  FfiConverterTypePageInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_get_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * The page's recognized text, or `None` while recognition is pending.
+     */
+open func getPageText(pageId: String)throws  -> PageTextInfo?  {
+    return try  FfiConverterOptionTypePageTextInfo.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_get_page_text(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),uniffiCallStatus
+    )
+})
+}
+    
 open func listDocuments()throws  -> [DocumentInfo]  {
     return try  FfiConverterSequenceTypeDocumentInfo.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
         uniffiCallStatus in
     uniffi_nolva_core_fn_method_nolvacore_list_documents(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * All folders, by name (ignoring case), with their document counts.
+     */
+open func listFolders()throws  -> [FolderInfo]  {
+    return try  FfiConverterSequenceTypeFolderInfo.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_list_folders(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -666,6 +1100,223 @@ open func listPages(documentId: String)throws  -> [PageInfo]  {
     uniffi_nolva_core_fn_method_nolvacore_list_pages(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(documentId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Documents in the trash, most recently trashed first.
+     */
+open func listTrashedDocuments()throws  -> [DocumentInfo]  {
+    return try  FfiConverterSequenceTypeDocumentInfo.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_list_trashed_documents(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Moves a document to the trash. It leaves `list_documents`, search
+     * and text recognition, and is deleted for good after 30 days unless
+     * restored.
+     */
+open func moveDocumentToTrash(documentId: String)throws   {try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_move_document_to_trash(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(documentId),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Moves documents into a folder (`None`: the top level), atomically.
+     * Returns how many moved; ids that no longer exist are skipped.
+     */
+open func moveDocuments(documentIds: [String], folderId: String?)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_move_documents(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(documentIds),
+        FfiConverterOptionString.lower(folderId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Moves a page to `to_position` (0-based; past the end means last) and
+     * returns the document's pages in their new order.
+     */
+open func movePage(pageId: String, toPosition: UInt32)throws  -> [PageInfo]  {
+    return try  FfiConverterSequenceTypePageInfo.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_move_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),
+        FfiConverterUInt32.lower(toPosition),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Up to `limit` pages whose text still has to be recognized, newest
+     * first: new pages and pages whose image changed since. Recognize each
+     * one's displayed image (`processed_path`, else `original_path`) and
+     * pass the result to [`Self::save_page_text`].
+     */
+open func pagesNeedingText(limit: UInt32)throws  -> [PageInfo]  {
+    return try  FfiConverterSequenceTypePageInfo.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_pages_needing_text(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(limit),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Permanently deletes documents trashed more than 30 days ago. Returns
+     * how many. Run it with the other maintenance, e.g. once per app start.
+     */
+open func purgeExpiredTrash()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_purge_expired_trash(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Deletes stored images that no page points to anymore (leftovers of
+     * failed deletions or interrupted imports). Files from the last hour are
+     * kept, so it is safe while the app is in use. Run it in the background,
+     * e.g. once per app start; it walks every stored file.
+     */
+open func removeOrphanFiles()throws  -> CleanupInfo  {
+    return try  FfiConverterTypeCleanupInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_remove_orphan_files(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func renameDocument(documentId: String, title: String)throws  -> DocumentInfo  {
+    return try  FfiConverterTypeDocumentInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_rename_document(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(documentId),
+        FfiConverterString.lower(title),uniffiCallStatus
+    )
+})
+}
+    
+open func renameFolder(folderId: String, name: String)throws  -> FolderInfo  {
+    return try  FfiConverterTypeFolderInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_rename_folder(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(folderId),
+        FfiConverterString.lower(name),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Takes a document out of the trash, as it was.
+     */
+open func restoreDocument(documentId: String)throws  -> DocumentInfo  {
+    return try  FfiConverterTypeDocumentInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_restore_document(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(documentId),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Turns the page a quarter, keeping its crop and filter. The original
+     * is never modified.
+     */
+open func rotatePage(pageId: String, clockwise: Bool)throws  -> PageInfo  {
+    return try  FfiConverterTypePageInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_rotate_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),
+        FfiConverterBool.lower(clockwise),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Stores the text recognized in `image_path`, the page's displayed
+     * image as [`PageInfo`] gave it. Fails with `Conflict` if the page
+     * shows another image by now (it was re-cropped meanwhile): drop the
+     * result, the page is pending again. Lines in reading order; blank
+     * lines are dropped and boxes are clamped into the image.
+     */
+open func savePageText(pageId: String, imagePath: String, lines: [RecognizedLine])throws  -> PageTextInfo  {
+    return try  FfiConverterTypePageTextInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_save_page_text(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),
+        FfiConverterString.lower(imagePath),
+        FfiConverterSequenceTypeRecognizedLine.lower(lines),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Pages whose text contains every word of `query` (as typed by the
+     * user; prefixes match, case and accents are ignored), best first, at
+     * most 50.
+     */
+open func searchText(query: String)throws  -> [TextSearchHit]  {
+    return try  FfiConverterSequenceTypeTextSearchHit.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_search_text(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(query),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Applies `filter` to the page, on top of its crop if it has one.
+     * CPU-heavy (up to about a second for a 12 MP photo): call it off the
+     * main thread.
+     */
+open func setPageFilter(pageId: String, filter: PageFilter)throws  -> PageInfo  {
+    return try  FfiConverterTypePageInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_set_page_filter(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),
+        FfiConverterTypePageFilter_lower(filter),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Sets crop, filter and rotation at once, e.g. to undo or redo an edit.
+     * Nothing is rendered if the page already looks like that.
+     */
+open func setPageRendering(pageId: String, corners: PageCorners?, filter: PageFilter, rotationDegrees: UInt32)throws  -> PageInfo  {
+    return try  FfiConverterTypePageInfo_lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_method_nolvacore_set_page_rendering(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pageId),
+        FfiConverterOptionTypePageCorners.lower(corners),
+        FfiConverterTypePageFilter_lower(filter),
+        FfiConverterUInt32.lower(rotationDegrees),uniffiCallStatus
     )
 })
 }
@@ -716,6 +1367,145 @@ public func FfiConverterTypeNolvaCore_lower(_ value: NolvaCore) -> UInt64 {
 }
 
 
+
+
+/**
+ * A grayscale camera preview frame: the luminance (Y) plane as camera APIs
+ * deliver it (Android `ImageProxy.planes[0]`, iOS `CVPixelBuffer` plane 0).
+ */
+public struct CameraFrame: Equatable, Hashable {
+    public var width: UInt32
+    public var height: UInt32
+    /**
+     * Bytes from the start of one row to the next; at least `width`.
+     */
+    public var rowStride: UInt32
+    public var luma: Data
+    /**
+     * Clockwise rotation that makes the frame upright: 0, 90, 180 or 270.
+     */
+    public var rotationDegrees: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(width: UInt32, height: UInt32, 
+        /**
+         * Bytes from the start of one row to the next; at least `width`.
+         */rowStride: UInt32, luma: Data, 
+        /**
+         * Clockwise rotation that makes the frame upright: 0, 90, 180 or 270.
+         */rotationDegrees: UInt32) {
+        self.width = width
+        self.height = height
+        self.rowStride = rowStride
+        self.luma = luma
+        self.rotationDegrees = rotationDegrees
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CameraFrame: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCameraFrame: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CameraFrame {
+        return
+            try CameraFrame(
+                width: FfiConverterUInt32.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf), 
+                rowStride: FfiConverterUInt32.read(from: &buf), 
+                luma: FfiConverterData.read(from: &buf), 
+                rotationDegrees: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CameraFrame, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.width, into: &buf)
+        FfiConverterUInt32.write(value.height, into: &buf)
+        FfiConverterUInt32.write(value.rowStride, into: &buf)
+        FfiConverterData.write(value.luma, into: &buf)
+        FfiConverterUInt32.write(value.rotationDegrees, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCameraFrame_lift(_ buf: RustBuffer) throws -> CameraFrame {
+    return try FfiConverterTypeCameraFrame.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCameraFrame_lower(_ value: CameraFrame) -> RustBuffer {
+    return FfiConverterTypeCameraFrame.lower(value)
+}
+
+
+/**
+ * What [`NolvaCore::remove_orphan_files`] cleaned up.
+ */
+public struct CleanupInfo: Equatable, Hashable {
+    public var filesRemoved: UInt32
+    public var bytesFreed: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(filesRemoved: UInt32, bytesFreed: UInt64) {
+        self.filesRemoved = filesRemoved
+        self.bytesFreed = bytesFreed
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CleanupInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCleanupInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CleanupInfo {
+        return
+            try CleanupInfo(
+                filesRemoved: FfiConverterUInt32.read(from: &buf), 
+                bytesFreed: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CleanupInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.filesRemoved, into: &buf)
+        FfiConverterUInt64.write(value.bytesFreed, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCleanupInfo_lift(_ buf: RustBuffer) throws -> CleanupInfo {
+    return try FfiConverterTypeCleanupInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCleanupInfo_lower(_ value: CleanupInfo) -> RustBuffer {
+    return FfiConverterTypeCleanupInfo.lower(value)
+}
 
 
 /**
@@ -781,21 +1571,122 @@ public func FfiConverterTypeCoreConfig_lower(_ value: CoreConfig) -> RustBuffer 
 }
 
 
+/**
+ * An automatically detected page outline.
+ */
+public struct CornerDetection: Equatable, Hashable {
+    public var corners: PageCorners
+    /**
+     * `0.0..=1.0`. Below ~0.6, ask the user to check the corners.
+     */
+    public var confidence: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(corners: PageCorners, 
+        /**
+         * `0.0..=1.0`. Below ~0.6, ask the user to check the corners.
+         */confidence: Float) {
+        self.corners = corners
+        self.confidence = confidence
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CornerDetection: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCornerDetection: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CornerDetection {
+        return
+            try CornerDetection(
+                corners: FfiConverterTypePageCorners.read(from: &buf), 
+                confidence: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CornerDetection, into buf: inout [UInt8]) {
+        FfiConverterTypePageCorners.write(value.corners, into: &buf)
+        FfiConverterFloat.write(value.confidence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCornerDetection_lift(_ buf: RustBuffer) throws -> CornerDetection {
+    return try FfiConverterTypeCornerDetection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCornerDetection_lower(_ value: CornerDetection) -> RustBuffer {
+    return FfiConverterTypeCornerDetection.lower(value)
+}
+
+
 public struct DocumentInfo: Equatable, Hashable {
     public var id: String
     public var title: String
     public var createdAtMs: Int64
     public var updatedAtMs: Int64
     public var pageCount: UInt32
+    /**
+     * Absolute path of the first page's image (processed if it has one),
+     * for thumbnails. `None` while the document has no pages.
+     */
+    public var coverPath: String?
+    /**
+     * When it was moved to the trash; `None` while it isn't.
+     */
+    public var trashedAtMs: Int64?
+    /**
+     * Folder it's in; `None` for the top level.
+     */
+    public var folderId: String?
+    /**
+     * Bytes its page images take. Filled in by listings
+     * (`list_documents`, `list_trashed_documents`) and by restore and
+     * duplicate; 0 elsewhere.
+     */
+    public var sizeBytes: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, title: String, createdAtMs: Int64, updatedAtMs: Int64, pageCount: UInt32) {
+    public init(id: String, title: String, createdAtMs: Int64, updatedAtMs: Int64, pageCount: UInt32, 
+        /**
+         * Absolute path of the first page's image (processed if it has one),
+         * for thumbnails. `None` while the document has no pages.
+         */coverPath: String?, 
+        /**
+         * When it was moved to the trash; `None` while it isn't.
+         */trashedAtMs: Int64?, 
+        /**
+         * Folder it's in; `None` for the top level.
+         */folderId: String?, 
+        /**
+         * Bytes its page images take. Filled in by listings
+         * (`list_documents`, `list_trashed_documents`) and by restore and
+         * duplicate; 0 elsewhere.
+         */sizeBytes: UInt64) {
         self.id = id
         self.title = title
         self.createdAtMs = createdAtMs
         self.updatedAtMs = updatedAtMs
         self.pageCount = pageCount
+        self.coverPath = coverPath
+        self.trashedAtMs = trashedAtMs
+        self.folderId = folderId
+        self.sizeBytes = sizeBytes
     }
 
     
@@ -818,7 +1709,11 @@ public struct FfiConverterTypeDocumentInfo: FfiConverterRustBuffer {
                 title: FfiConverterString.read(from: &buf), 
                 createdAtMs: FfiConverterInt64.read(from: &buf), 
                 updatedAtMs: FfiConverterInt64.read(from: &buf), 
-                pageCount: FfiConverterUInt32.read(from: &buf)
+                pageCount: FfiConverterUInt32.read(from: &buf), 
+                coverPath: FfiConverterOptionString.read(from: &buf), 
+                trashedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                folderId: FfiConverterOptionString.read(from: &buf), 
+                sizeBytes: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -828,6 +1723,10 @@ public struct FfiConverterTypeDocumentInfo: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.createdAtMs, into: &buf)
         FfiConverterInt64.write(value.updatedAtMs, into: &buf)
         FfiConverterUInt32.write(value.pageCount, into: &buf)
+        FfiConverterOptionString.write(value.coverPath, into: &buf)
+        FfiConverterOptionInt64.write(value.trashedAtMs, into: &buf)
+        FfiConverterOptionString.write(value.folderId, into: &buf)
+        FfiConverterUInt64.write(value.sizeBytes, into: &buf)
     }
 }
 
@@ -847,14 +1746,351 @@ public func FfiConverterTypeDocumentInfo_lower(_ value: DocumentInfo) -> RustBuf
 }
 
 
+public struct DocxExportInfo: Equatable, Hashable {
+    public var pageCount: UInt32
+    public var sizeBytes: UInt64
+    /**
+     * Pages exported without text because it wasn't recognized yet.
+     */
+    public var pagesPendingText: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pageCount: UInt32, sizeBytes: UInt64, 
+        /**
+         * Pages exported without text because it wasn't recognized yet.
+         */pagesPendingText: UInt32) {
+        self.pageCount = pageCount
+        self.sizeBytes = sizeBytes
+        self.pagesPendingText = pagesPendingText
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DocxExportInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDocxExportInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DocxExportInfo {
+        return
+            try DocxExportInfo(
+                pageCount: FfiConverterUInt32.read(from: &buf), 
+                sizeBytes: FfiConverterUInt64.read(from: &buf), 
+                pagesPendingText: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DocxExportInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.pageCount, into: &buf)
+        FfiConverterUInt64.write(value.sizeBytes, into: &buf)
+        FfiConverterUInt32.write(value.pagesPendingText, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDocxExportInfo_lift(_ buf: RustBuffer) throws -> DocxExportInfo {
+    return try FfiConverterTypeDocxExportInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDocxExportInfo_lower(_ value: DocxExportInfo) -> RustBuffer {
+    return FfiConverterTypeDocxExportInfo.lower(value)
+}
+
+
+public struct DocxOptions: Equatable, Hashable {
+    /**
+     * Append each page's image after the text.
+     */
+    public var includeImages: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Append each page's image after the text.
+         */includeImages: Bool) {
+        self.includeImages = includeImages
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DocxOptions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDocxOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DocxOptions {
+        return
+            try DocxOptions(
+                includeImages: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DocxOptions, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.includeImages, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDocxOptions_lift(_ buf: RustBuffer) throws -> DocxOptions {
+    return try FfiConverterTypeDocxOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDocxOptions_lower(_ value: DocxOptions) -> RustBuffer {
+    return FfiConverterTypeDocxOptions.lower(value)
+}
+
+
+/**
+ * A folder of documents. Folders don't nest.
+ */
+public struct FolderInfo: Equatable, Hashable {
+    public var id: String
+    public var name: String
+    public var createdAtMs: Int64
+    public var updatedAtMs: Int64
+    /**
+     * Documents in it, not counting trashed ones.
+     */
+    public var documentCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, createdAtMs: Int64, updatedAtMs: Int64, 
+        /**
+         * Documents in it, not counting trashed ones.
+         */documentCount: UInt32) {
+        self.id = id
+        self.name = name
+        self.createdAtMs = createdAtMs
+        self.updatedAtMs = updatedAtMs
+        self.documentCount = documentCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FolderInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFolderInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FolderInfo {
+        return
+            try FolderInfo(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                createdAtMs: FfiConverterInt64.read(from: &buf), 
+                updatedAtMs: FfiConverterInt64.read(from: &buf), 
+                documentCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FolderInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterInt64.write(value.createdAtMs, into: &buf)
+        FfiConverterInt64.write(value.updatedAtMs, into: &buf)
+        FfiConverterUInt32.write(value.documentCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderInfo_lift(_ buf: RustBuffer) throws -> FolderInfo {
+    return try FfiConverterTypeFolderInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderInfo_lower(_ value: FolderInfo) -> RustBuffer {
+    return FfiConverterTypeFolderInfo.lower(value)
+}
+
+
+/**
+ * A point in normalized image coordinates (`0.0..=1.0`, origin top left)
+ * of the original image as displayed (EXIF orientation applied).
+ */
+public struct NormalizedPoint: Equatable, Hashable {
+    public var x: Float
+    public var y: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(x: Float, y: Float) {
+        self.x = x
+        self.y = y
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NormalizedPoint: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNormalizedPoint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NormalizedPoint {
+        return
+            try NormalizedPoint(
+                x: FfiConverterFloat.read(from: &buf), 
+                y: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NormalizedPoint, into buf: inout [UInt8]) {
+        FfiConverterFloat.write(value.x, into: &buf)
+        FfiConverterFloat.write(value.y, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNormalizedPoint_lift(_ buf: RustBuffer) throws -> NormalizedPoint {
+    return try FfiConverterTypeNormalizedPoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNormalizedPoint_lower(_ value: NormalizedPoint) -> RustBuffer {
+    return FfiConverterTypeNormalizedPoint.lower(value)
+}
+
+
+/**
+ * The four corners of a page outline.
+ */
+public struct PageCorners: Equatable, Hashable {
+    public var topLeft: NormalizedPoint
+    public var topRight: NormalizedPoint
+    public var bottomRight: NormalizedPoint
+    public var bottomLeft: NormalizedPoint
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(topLeft: NormalizedPoint, topRight: NormalizedPoint, bottomRight: NormalizedPoint, bottomLeft: NormalizedPoint) {
+        self.topLeft = topLeft
+        self.topRight = topRight
+        self.bottomRight = bottomRight
+        self.bottomLeft = bottomLeft
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PageCorners: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePageCorners: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PageCorners {
+        return
+            try PageCorners(
+                topLeft: FfiConverterTypeNormalizedPoint.read(from: &buf), 
+                topRight: FfiConverterTypeNormalizedPoint.read(from: &buf), 
+                bottomRight: FfiConverterTypeNormalizedPoint.read(from: &buf), 
+                bottomLeft: FfiConverterTypeNormalizedPoint.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PageCorners, into buf: inout [UInt8]) {
+        FfiConverterTypeNormalizedPoint.write(value.topLeft, into: &buf)
+        FfiConverterTypeNormalizedPoint.write(value.topRight, into: &buf)
+        FfiConverterTypeNormalizedPoint.write(value.bottomRight, into: &buf)
+        FfiConverterTypeNormalizedPoint.write(value.bottomLeft, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageCorners_lift(_ buf: RustBuffer) throws -> PageCorners {
+    return try FfiConverterTypePageCorners.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageCorners_lower(_ value: PageCorners) -> RustBuffer {
+    return FfiConverterTypePageCorners.lower(value)
+}
+
+
 public struct PageInfo: Equatable, Hashable {
     public var id: String
     public var documentId: String
     public var position: UInt32
     /**
      * Absolute path of the original image, resolved for the current install.
+     * Never modified.
      */
     public var originalPath: String
+    /**
+     * Absolute path of the cropped and/or filtered image, if the page has
+     * a crop or a filter. Show this when present, else the original.
+     */
+    public var processedPath: String?
+    /**
+     * Corners used for `processed_path`, to reopen the crop editor where
+     * the user left it.
+     */
+    public var corners: PageCorners?
+    /**
+     * Filter applied on top of the crop.
+     */
+    public var filter: PageFilter
+    /**
+     * Clockwise quarter turns applied after the crop: 0, 90, 180 or 270.
+     */
+    public var rotationDegrees: UInt32
     public var createdAtMs: Int64
 
     // Default memberwise initializers are never public by default, so we
@@ -862,11 +2098,30 @@ public struct PageInfo: Equatable, Hashable {
     public init(id: String, documentId: String, position: UInt32, 
         /**
          * Absolute path of the original image, resolved for the current install.
-         */originalPath: String, createdAtMs: Int64) {
+         * Never modified.
+         */originalPath: String, 
+        /**
+         * Absolute path of the cropped and/or filtered image, if the page has
+         * a crop or a filter. Show this when present, else the original.
+         */processedPath: String?, 
+        /**
+         * Corners used for `processed_path`, to reopen the crop editor where
+         * the user left it.
+         */corners: PageCorners?, 
+        /**
+         * Filter applied on top of the crop.
+         */filter: PageFilter, 
+        /**
+         * Clockwise quarter turns applied after the crop: 0, 90, 180 or 270.
+         */rotationDegrees: UInt32, createdAtMs: Int64) {
         self.id = id
         self.documentId = documentId
         self.position = position
         self.originalPath = originalPath
+        self.processedPath = processedPath
+        self.corners = corners
+        self.filter = filter
+        self.rotationDegrees = rotationDegrees
         self.createdAtMs = createdAtMs
     }
 
@@ -890,6 +2145,10 @@ public struct FfiConverterTypePageInfo: FfiConverterRustBuffer {
                 documentId: FfiConverterString.read(from: &buf), 
                 position: FfiConverterUInt32.read(from: &buf), 
                 originalPath: FfiConverterString.read(from: &buf), 
+                processedPath: FfiConverterOptionString.read(from: &buf), 
+                corners: FfiConverterOptionTypePageCorners.read(from: &buf), 
+                filter: FfiConverterTypePageFilter.read(from: &buf), 
+                rotationDegrees: FfiConverterUInt32.read(from: &buf), 
                 createdAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -899,6 +2158,10 @@ public struct FfiConverterTypePageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.documentId, into: &buf)
         FfiConverterUInt32.write(value.position, into: &buf)
         FfiConverterString.write(value.originalPath, into: &buf)
+        FfiConverterOptionString.write(value.processedPath, into: &buf)
+        FfiConverterOptionTypePageCorners.write(value.corners, into: &buf)
+        FfiConverterTypePageFilter.write(value.filter, into: &buf)
+        FfiConverterUInt32.write(value.rotationDegrees, into: &buf)
         FfiConverterInt64.write(value.createdAtMs, into: &buf)
     }
 }
@@ -916,6 +2179,394 @@ public func FfiConverterTypePageInfo_lift(_ buf: RustBuffer) throws -> PageInfo 
 #endif
 public func FfiConverterTypePageInfo_lower(_ value: PageInfo) -> RustBuffer {
     return FfiConverterTypePageInfo.lower(value)
+}
+
+
+public struct PageTextInfo: Equatable, Hashable {
+    public var pageId: String
+    /**
+     * All the text: lines separated by newlines, blocks by a blank line.
+     */
+    public var text: String
+    public var lines: [RecognizedLine]
+    public var recognizedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pageId: String, 
+        /**
+         * All the text: lines separated by newlines, blocks by a blank line.
+         */text: String, lines: [RecognizedLine], recognizedAtMs: Int64) {
+        self.pageId = pageId
+        self.text = text
+        self.lines = lines
+        self.recognizedAtMs = recognizedAtMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PageTextInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePageTextInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PageTextInfo {
+        return
+            try PageTextInfo(
+                pageId: FfiConverterString.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf), 
+                lines: FfiConverterSequenceTypeRecognizedLine.read(from: &buf), 
+                recognizedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PageTextInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.pageId, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterSequenceTypeRecognizedLine.write(value.lines, into: &buf)
+        FfiConverterInt64.write(value.recognizedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageTextInfo_lift(_ buf: RustBuffer) throws -> PageTextInfo {
+    return try FfiConverterTypePageTextInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageTextInfo_lower(_ value: PageTextInfo) -> RustBuffer {
+    return FfiConverterTypePageTextInfo.lower(value)
+}
+
+
+public struct PdfExportInfo: Equatable, Hashable {
+    public var pageCount: UInt32
+    public var sizeBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pageCount: UInt32, sizeBytes: UInt64) {
+        self.pageCount = pageCount
+        self.sizeBytes = sizeBytes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PdfExportInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePdfExportInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PdfExportInfo {
+        return
+            try PdfExportInfo(
+                pageCount: FfiConverterUInt32.read(from: &buf), 
+                sizeBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PdfExportInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.pageCount, into: &buf)
+        FfiConverterUInt64.write(value.sizeBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePdfExportInfo_lift(_ buf: RustBuffer) throws -> PdfExportInfo {
+    return try FfiConverterTypePdfExportInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePdfExportInfo_lower(_ value: PdfExportInfo) -> RustBuffer {
+    return FfiConverterTypePdfExportInfo.lower(value)
+}
+
+
+public struct PdfOptions: Equatable, Hashable {
+    public var paperSize: PaperSize
+    /**
+     * White margin around each image on fixed-size pages, in millimetres.
+     */
+    public var marginMm: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(paperSize: PaperSize, 
+        /**
+         * White margin around each image on fixed-size pages, in millimetres.
+         */marginMm: Float) {
+        self.paperSize = paperSize
+        self.marginMm = marginMm
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PdfOptions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePdfOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PdfOptions {
+        return
+            try PdfOptions(
+                paperSize: FfiConverterTypePaperSize.read(from: &buf), 
+                marginMm: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PdfOptions, into buf: inout [UInt8]) {
+        FfiConverterTypePaperSize.write(value.paperSize, into: &buf)
+        FfiConverterFloat.write(value.marginMm, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePdfOptions_lift(_ buf: RustBuffer) throws -> PdfOptions {
+    return try FfiConverterTypePdfOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePdfOptions_lower(_ value: PdfOptions) -> RustBuffer {
+    return FfiConverterTypePdfOptions.lower(value)
+}
+
+
+/**
+ * One line of recognized text, as the platform recognizer reports it.
+ */
+public struct RecognizedLine: Equatable, Hashable {
+    /**
+     * Block (paragraph or column) index in reading order; lines of the same
+     * block are consecutive.
+     */
+    public var block: UInt32
+    public var text: String
+    public var bounds: TextRect
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Block (paragraph or column) index in reading order; lines of the same
+         * block are consecutive.
+         */block: UInt32, text: String, bounds: TextRect) {
+        self.block = block
+        self.text = text
+        self.bounds = bounds
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RecognizedLine: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRecognizedLine: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RecognizedLine {
+        return
+            try RecognizedLine(
+                block: FfiConverterUInt32.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf), 
+                bounds: FfiConverterTypeTextRect.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RecognizedLine, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.block, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterTypeTextRect.write(value.bounds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecognizedLine_lift(_ buf: RustBuffer) throws -> RecognizedLine {
+    return try FfiConverterTypeRecognizedLine.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecognizedLine_lower(_ value: RecognizedLine) -> RustBuffer {
+    return FfiConverterTypeRecognizedLine.lower(value)
+}
+
+
+/**
+ * Rectangle in normalized coordinates (`0.0..=1.0`) of the page image the
+ * text was recognized in, origin at the top left.
+ */
+public struct TextRect: Equatable, Hashable {
+    public var left: Float
+    public var top: Float
+    public var right: Float
+    public var bottom: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(left: Float, top: Float, right: Float, bottom: Float) {
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TextRect: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTextRect: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TextRect {
+        return
+            try TextRect(
+                left: FfiConverterFloat.read(from: &buf), 
+                top: FfiConverterFloat.read(from: &buf), 
+                right: FfiConverterFloat.read(from: &buf), 
+                bottom: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TextRect, into buf: inout [UInt8]) {
+        FfiConverterFloat.write(value.left, into: &buf)
+        FfiConverterFloat.write(value.top, into: &buf)
+        FfiConverterFloat.write(value.right, into: &buf)
+        FfiConverterFloat.write(value.bottom, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTextRect_lift(_ buf: RustBuffer) throws -> TextRect {
+    return try FfiConverterTypeTextRect.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTextRect_lower(_ value: TextRect) -> RustBuffer {
+    return FfiConverterTypeTextRect.lower(value)
+}
+
+
+/**
+ * A page whose text matches a search.
+ */
+public struct TextSearchHit: Equatable, Hashable {
+    public var documentId: String
+    public var pageId: String
+    public var pagePosition: UInt32
+    /**
+     * Short excerpt around the match.
+     */
+    public var snippet: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(documentId: String, pageId: String, pagePosition: UInt32, 
+        /**
+         * Short excerpt around the match.
+         */snippet: String) {
+        self.documentId = documentId
+        self.pageId = pageId
+        self.pagePosition = pagePosition
+        self.snippet = snippet
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TextSearchHit: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTextSearchHit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TextSearchHit {
+        return
+            try TextSearchHit(
+                documentId: FfiConverterString.read(from: &buf), 
+                pageId: FfiConverterString.read(from: &buf), 
+                pagePosition: FfiConverterUInt32.read(from: &buf), 
+                snippet: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TextSearchHit, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.documentId, into: &buf)
+        FfiConverterString.write(value.pageId, into: &buf)
+        FfiConverterUInt32.write(value.pagePosition, into: &buf)
+        FfiConverterString.write(value.snippet, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTextSearchHit_lift(_ buf: RustBuffer) throws -> TextSearchHit {
+    return try FfiConverterTypeTextSearchHit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTextSearchHit_lower(_ value: TextSearchHit) -> RustBuffer {
+    return FfiConverterTypeTextSearchHit.lower(value)
 }
 
 
@@ -938,6 +2589,11 @@ enum NolvaError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
     case Unsupported(reason: String
     )
     case Storage(reason: String
+    )
+    /**
+     * The data changed while the operation ran; it no longer applies.
+     */
+    case Conflict(reason: String
     )
 
     
@@ -980,6 +2636,9 @@ public struct FfiConverterTypeNolvaError: FfiConverterRustBuffer {
         case 4: return .Storage(
             reason: try FfiConverterString.read(from: &buf)
             )
+        case 5: return .Conflict(
+            reason: try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1011,6 +2670,11 @@ public struct FfiConverterTypeNolvaError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
             FfiConverterString.write(reason, into: &buf)
             
+        
+        case let .Conflict(reason):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(reason, into: &buf)
+            
         }
     }
 }
@@ -1028,6 +2692,333 @@ public func FfiConverterTypeNolvaError_lift(_ buf: RustBuffer) throws -> NolvaEr
 #endif
 public func FfiConverterTypeNolvaError_lower(_ value: NolvaError) -> RustBuffer {
     return FfiConverterTypeNolvaError.lower(value)
+}
+
+
+/**
+ * Look applied to a page on top of its crop. Always rendered from the
+ * original, so switching filters never degrades the image.
+ */
+
+public enum PageFilter: Equatable, Hashable {
+    
+    /**
+     * Colors as photographed.
+     */
+    case original
+    case grayscale
+    /**
+     * Pure black ink on white paper: smallest files, best for text.
+     */
+    case blackAndWhite
+    /**
+     * Evens out lighting and shadows, whitens the paper, keeps colors.
+     */
+    case enhanced
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PageFilter: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePageFilter: FfiConverterRustBuffer {
+    typealias SwiftType = PageFilter
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PageFilter {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .original
+        
+        case 2: return .grayscale
+        
+        case 3: return .blackAndWhite
+        
+        case 4: return .enhanced
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PageFilter, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .original:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .grayscale:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .blackAndWhite:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .enhanced:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageFilter_lift(_ buf: RustBuffer) throws -> PageFilter {
+    return try FfiConverterTypePageFilter.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePageFilter_lower(_ value: PageFilter) -> RustBuffer {
+    return FfiConverterTypePageFilter.lower(value)
+}
+
+
+
+/**
+ * Paper size for exported PDFs.
+ */
+
+public enum PaperSize: Equatable, Hashable {
+    
+    /**
+     * Each page takes the proportions of its image (good for receipts).
+     */
+    case fitImage
+    case a4
+    case letter
+    /**
+     * 8.5 × 14 in, the usual "oficio".
+     */
+    case legal
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PaperSize: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePaperSize: FfiConverterRustBuffer {
+    typealias SwiftType = PaperSize
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PaperSize {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .fitImage
+        
+        case 2: return .a4
+        
+        case 3: return .letter
+        
+        case 4: return .legal
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PaperSize, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .fitImage:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .a4:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .letter:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .legal:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePaperSize_lift(_ buf: RustBuffer) throws -> PaperSize {
+    return try FfiConverterTypePaperSize.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePaperSize_lower(_ value: PaperSize) -> RustBuffer {
+    return FfiConverterTypePaperSize.lower(value)
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCornerDetection: FfiConverterRustBuffer {
+    typealias SwiftType = CornerDetection?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCornerDetection.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCornerDetection.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePageCorners: FfiConverterRustBuffer {
+    typealias SwiftType = PageCorners?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePageCorners.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePageCorners.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePageTextInfo: FfiConverterRustBuffer {
+    typealias SwiftType = PageTextInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePageTextInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePageTextInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
 }
 
 #if swift(>=5.8)
@@ -1058,6 +3049,31 @@ fileprivate struct FfiConverterSequenceTypeDocumentInfo: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFolderInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [FolderInfo]
+
+    public static func write(_ value: [FolderInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFolderInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FolderInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FolderInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFolderInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePageInfo: FfiConverterRustBuffer {
     typealias SwiftType = [PageInfo]
 
@@ -1079,6 +3095,56 @@ fileprivate struct FfiConverterSequenceTypePageInfo: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeRecognizedLine: FfiConverterRustBuffer {
+    typealias SwiftType = [RecognizedLine]
+
+    public static func write(_ value: [RecognizedLine], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeRecognizedLine.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [RecognizedLine] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [RecognizedLine]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeRecognizedLine.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeTextSearchHit: FfiConverterRustBuffer {
+    typealias SwiftType = [TextSearchHit]
+
+    public static func write(_ value: [TextSearchHit], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTextSearchHit.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TextSearchHit] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TextSearchHit]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTextSearchHit.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
  * Version of the core library, for diagnostics and compatibility checks.
  */
@@ -1086,6 +3152,20 @@ public func coreVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_nolva_core_fn_func_core_version(uniffiCallStatus
+    )
+})
+}
+/**
+ * Finds the sheet in a live camera frame, for drawing a guide over the
+ * preview and capturing automatically. Corners are normalized to the
+ * upright frame. Takes a few milliseconds; call it from the camera's
+ * analysis thread, not the main thread. Needs no `NolvaCore`.
+ */
+public func detectCornersInFrame(frame: CameraFrame)throws  -> CornerDetection?  {
+    return try  FfiConverterOptionTypeCornerDetection.lift(try rustCallWithError(FfiConverterTypeNolvaError_lift) {
+        uniffiCallStatus in
+    uniffi_nolva_core_fn_func_detect_corners_in_frame(
+        FfiConverterTypeCameraFrame_lower(frame),uniffiCallStatus
     )
 })
 }
@@ -1108,16 +3188,106 @@ private let initializationResult: InitializationResult = {
     if (uniffi_nolva_core_checksum_func_core_version() != 60836) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nolva_core_checksum_func_detect_corners_in_frame() != 3122) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nolva_core_checksum_method_nolvacore_add_page() != 29081) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nolva_core_checksum_method_nolvacore_create_document() != 10378) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nolva_core_checksum_method_nolvacore_create_document_in_folder() != 48612) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_create_folder() != 55854) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_crop_page() != 44767) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_delete_document() != 16250) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_delete_folder() != 29211) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_delete_page() != 8102) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_detect_page_corners() != 63951) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_duplicate_document() != 37106) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_empty_trash() != 21296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_export_docx() != 42123) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_export_pdf() != 54162) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_get_page() != 38191) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_get_page_text() != 38208) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nolva_core_checksum_method_nolvacore_list_documents() != 42470) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nolva_core_checksum_method_nolvacore_list_folders() != 52094) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nolva_core_checksum_method_nolvacore_list_pages() != 2081) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_list_trashed_documents() != 61270) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_move_document_to_trash() != 20069) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_move_documents() != 32512) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_move_page() != 27381) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_pages_needing_text() != 32889) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_purge_expired_trash() != 7884) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_remove_orphan_files() != 35918) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_rename_document() != 38127) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_rename_folder() != 41028) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_restore_document() != 52375) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_rotate_page() != 42672) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_save_page_text() != 12695) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_search_text() != 39470) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_set_page_filter() != 63911) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nolva_core_checksum_method_nolvacore_set_page_rendering() != 52227) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nolva_core_checksum_constructor_nolvacore_new() != 34795) {
