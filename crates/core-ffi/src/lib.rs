@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use document_engine::{
     Crop, Document, DocumentError, DocumentId, DocumentService, FolderId, Page, PageFileStore,
-    PageId, PageText, PdfExportOptions, SystemClock, TextBounds, TextLine,
+    PageId, PageText, PdfExportOptions, Rotation, SystemClock, TextBounds, TextLine,
 };
 use storage_engine::{DATABASE_FILE_NAME, LocalPageFileStore, SqliteDocumentRepository};
 
@@ -142,6 +142,8 @@ pub struct PageInfo {
     pub corners: Option<PageCorners>,
     /// Filter applied on top of the crop.
     pub filter: PageFilter,
+    /// Clockwise quarter turns applied after the crop: 0, 90, 180 or 270.
+    pub rotation_degrees: u32,
     pub created_at_ms: i64,
 }
 
@@ -316,6 +318,7 @@ impl From<DocumentError> for NolvaError {
             DocumentError::InvalidTitle { .. }
             | DocumentError::InvalidId { .. }
             | DocumentError::InvalidCorners { .. }
+            | DocumentError::InvalidRotation { .. }
             | DocumentError::EmptyDocument(_)
             | DocumentError::InvalidText { .. } => Self::InvalidArgument { reason },
             DocumentError::PageImageChanged(_) => Self::Conflict { reason },
@@ -713,6 +716,31 @@ impl NolvaCore {
         let id: PageId = page_id.parse()?;
         Ok(self.page_info(self.service.set_page_filter(id, filter.into())?))
     }
+
+    /// Turns the page a quarter, keeping its crop and filter. The original
+    /// is never modified.
+    pub fn rotate_page(&self, page_id: String, clockwise: bool) -> Result<PageInfo, NolvaError> {
+        let id: PageId = page_id.parse()?;
+        Ok(self.page_info(self.service.rotate_page(id, clockwise)?))
+    }
+
+    /// Sets crop, filter and rotation at once, e.g. to undo or redo an edit.
+    /// Nothing is rendered if the page already looks like that.
+    pub fn set_page_rendering(
+        &self,
+        page_id: String,
+        corners: Option<PageCorners>,
+        filter: PageFilter,
+        rotation_degrees: u32,
+    ) -> Result<PageInfo, NolvaError> {
+        let id: PageId = page_id.parse()?;
+        let crop = corners.map(Crop::try_from).transpose()?;
+        let rotation = Rotation::from_degrees(rotation_degrees)?;
+        Ok(self.page_info(
+            self.service
+                .set_page_rendering(id, crop, filter.into(), rotation)?,
+        ))
+    }
 }
 
 impl NolvaCore {
@@ -744,6 +772,7 @@ impl NolvaCore {
             processed_path: page.processed_path.as_deref().map(absolute),
             corners: page.crop.map(PageCorners::from),
             filter: page.filter.into(),
+            rotation_degrees: page.rotation.degrees(),
             created_at_ms: page.created_at_ms,
         }
     }
@@ -1147,6 +1176,41 @@ mod tests {
         drop(core);
         let reopened = super::tests::core(&data);
         assert_eq!(reopened.get_page(page.id).unwrap(), recropped);
+    }
+
+    #[test]
+    fn rotation_turns_the_image_and_can_be_undone() {
+        let data = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let core = core(&data);
+        let doc = core.create_document("Giro".into()).unwrap();
+        let page = core
+            .add_page(
+                doc.id.clone(),
+                photo_of_tilted_sheet(src.path()).to_string_lossy().into(),
+            )
+            .unwrap();
+        let (w, h) = image::image_dimensions(&page.original_path).unwrap();
+
+        let turned = core.rotate_page(page.id.clone(), true).unwrap();
+        assert_eq!(turned.rotation_degrees, 90);
+        let path = turned.processed_path.clone().expect("rotation renders");
+        assert_eq!(image::image_dimensions(&path).unwrap(), (h, w));
+
+        let half = core.rotate_page(page.id.clone(), true).unwrap();
+        assert_eq!(half.rotation_degrees, 180);
+        assert!(!Path::new(&path).exists(), "old render removed");
+
+        // Undo back to how it was imported.
+        let undone = core
+            .set_page_rendering(page.id.clone(), None, PageFilter::Original, 0)
+            .unwrap();
+        assert_eq!(undone.rotation_degrees, 0);
+        assert_eq!(undone.processed_path, None);
+        assert!(matches!(
+            core.set_page_rendering(page.id, None, PageFilter::Original, 45),
+            Err(NolvaError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

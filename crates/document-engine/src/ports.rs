@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::error::{PortError, ProcessingError};
 use crate::model::{
     Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
+    Rotation,
 };
 use crate::text::{PageText, TextLine, TextMatch};
 
@@ -106,6 +107,7 @@ pub trait DocumentRepository: Send + Sync {
         id: PageId,
         crop: Option<&Crop>,
         filter: PageFilter,
+        rotation: Rotation,
         processed_path: Option<&Path>,
         updated_at_ms: i64,
     ) -> Result<Page, PortError>;
@@ -201,13 +203,14 @@ pub trait PageProcessor: Send + Sync {
     /// Finds the page outline in the image at `original`, if any.
     fn detect_corners(&self, original: &Path) -> Result<Option<CornerDetection>, ProcessingError>;
 
-    /// Writes `original`, straightened to `crop` when given and with
-    /// `filter` applied, to `output`, atomically.
+    /// Writes `original`, straightened to `crop` when given, turned by
+    /// `rotation` and with `filter` applied, to `output`, atomically.
     fn render_page(
         &self,
         original: &Path,
         crop: Option<&Crop>,
         filter: PageFilter,
+        rotation: Rotation,
         output: &Path,
     ) -> Result<(), ProcessingError>;
 }

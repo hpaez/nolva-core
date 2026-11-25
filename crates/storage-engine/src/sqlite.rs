@@ -3,7 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use document_engine::{
     Crop, Document, DocumentId, DocumentRepository, Folder, FolderId, NewPage, Page, PageFilter,
-    PageId, PageText, PortError, TextBounds, TextLine, TextMatch,
+    PageId, PageText, PortError, Rotation, TextBounds, TextLine, TextMatch,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -119,8 +119,7 @@ fn folder_from_row(row: &Row<'_>) -> rusqlite::Result<Folder> {
     })
 }
 
-const PAGE_COLUMNS: &str =
-    "id, document_id, position, original_path, created_at_ms, crop, processed_path, filter";
+const PAGE_COLUMNS: &str = "id, document_id, position, original_path, created_at_ms, crop, processed_path, filter, rotation";
 
 fn page_from_row(row: &Row<'_>) -> rusqlite::Result<Page> {
     let original: String = row.get(3)?;
@@ -137,6 +136,9 @@ fn page_from_row(row: &Row<'_>) -> rusqlite::Result<Page> {
         })?,
         filter: filter_from_db(&filter).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, e.into())
+        })?,
+        rotation: Rotation::from_degrees(row.get(8)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Integer, e.into())
         })?,
         processed_path: processed.map(PathBuf::from),
         created_at_ms: row.get(4)?,
@@ -482,6 +484,7 @@ impl DocumentRepository for SqliteDocumentRepository {
             original_path: p.original_path.clone(),
             crop: None,
             filter: PageFilter::Original,
+            rotation: Rotation::None,
             processed_path: None,
             created_at_ms: p.created_at_ms,
         })
@@ -603,6 +606,7 @@ impl DocumentRepository for SqliteDocumentRepository {
         id: PageId,
         crop: Option<&Crop>,
         filter: PageFilter,
+        rotation: Rotation,
         processed_path: Option<&Path>,
         updated_at_ms: i64,
     ) -> Result<Page, PortError> {
@@ -614,12 +618,14 @@ impl DocumentRepository for SqliteDocumentRepository {
 
         let changed = tx
             .execute(
-                "UPDATE pages SET crop = ?2, processed_path = ?3, filter = ?4 WHERE id = ?1",
+                "UPDATE pages SET crop = ?2, processed_path = ?3, filter = ?4, rotation = ?5
+                 WHERE id = ?1",
                 params![
                     id.to_string(),
                     crop.map(crop_to_db),
                     processed,
-                    filter_to_db(filter)
+                    filter_to_db(filter),
+                    rotation.degrees()
                 ],
             )
             .map_err(|e| PortError::new("set page rendering", e))?;
@@ -918,6 +924,7 @@ mod tests {
                 page.id,
                 Some(&crop),
                 PageFilter::Enhanced,
+                Rotation::None,
                 Some(Path::new("documents/x/processed-1.jpg")),
                 50,
             )
@@ -935,7 +942,14 @@ mod tests {
 
         // Back to the untouched original.
         let reset = repo
-            .set_page_rendering(page.id, None, PageFilter::Original, None, 60)
+            .set_page_rendering(
+                page.id,
+                None,
+                PageFilter::Original,
+                Rotation::None,
+                None,
+                60,
+            )
             .unwrap();
         assert_eq!(
             (reset.crop, reset.filter, reset.processed_path),
@@ -956,8 +970,15 @@ mod tests {
             PageFilter::Enhanced,
             PageFilter::Original,
         ] {
-            repo.set_page_rendering(page.id, None, filter, Some(Path::new("p.jpg")), 3)
-                .unwrap();
+            repo.set_page_rendering(
+                page.id,
+                None,
+                filter,
+                Rotation::None,
+                Some(Path::new("p.jpg")),
+                3,
+            )
+            .unwrap();
             assert_eq!(repo.get_page(page.id).unwrap().unwrap().filter, filter);
         }
     }
@@ -979,6 +1000,7 @@ mod tests {
             first.id,
             None,
             PageFilter::Grayscale,
+            Rotation::None,
             Some(Path::new("p.jpg")),
             4,
         )
@@ -1057,6 +1079,7 @@ mod tests {
             older.id,
             None,
             PageFilter::Grayscale,
+            Rotation::None,
             Some(Path::new("g.jpg")),
             4,
         )
@@ -1144,6 +1167,7 @@ mod tests {
             page.id,
             None,
             PageFilter::Grayscale,
+            Rotation::None,
             Some(Path::new("g.jpg")),
             3,
         )
@@ -1186,6 +1210,32 @@ mod tests {
             updated_at_ms: 1,
             document_count: 0,
         }
+    }
+
+    #[test]
+    fn rotation_round_trips_and_existing_pages_start_upright() {
+        let repo = SqliteDocumentRepository::open_in_memory().unwrap();
+        let d = doc("d", 1);
+        repo.insert_document(&d).unwrap();
+        let page = repo.append_page(&new_page(d.id, 2)).unwrap();
+        assert_eq!(
+            repo.get_page(page.id).unwrap().unwrap().rotation,
+            Rotation::None
+        );
+
+        let turned = repo
+            .set_page_rendering(
+                page.id,
+                None,
+                PageFilter::Original,
+                Rotation::Clockwise270,
+                Some(Path::new("r.jpg")),
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(turned.rotation, Rotation::Clockwise270);
+        assert_eq!(repo.get_page(page.id).unwrap().unwrap(), turned);
     }
 
     #[test]
@@ -1251,6 +1301,7 @@ mod tests {
             page.id,
             None,
             PageFilter::Grayscale,
+            Rotation::None,
             Some(Path::new("g.jpg")),
             3,
         )
@@ -1324,6 +1375,7 @@ mod tests {
             first.id,
             None,
             PageFilter::Grayscale,
+            Rotation::None,
             Some(Path::new("p.jpg")),
             4,
         )
@@ -1439,6 +1491,7 @@ mod tests {
                 PageId::new(),
                 Some(&crop),
                 PageFilter::Original,
+                Rotation::None,
                 Some(Path::new("x.jpg")),
                 1
             )

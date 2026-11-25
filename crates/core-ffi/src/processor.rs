@@ -5,7 +5,7 @@ use std::path::Path;
 
 use document_engine::{
     CornerDetection, Crop, DocumentExporter, DocxExportOptions, ExportPage, ExportSummary,
-    PageFilter, PageProcessor, PaperSize, PdfExportOptions, PortError, ProcessingError,
+    PageFilter, PageProcessor, PaperSize, PdfExportOptions, PortError, ProcessingError, Rotation,
 };
 use docx_engine::{DocxError, DocxLine, DocxOptions, DocxPage, write_docx};
 use image_engine::{
@@ -35,6 +35,7 @@ impl PageProcessor for ImagePageProcessor {
         original: &Path,
         crop: Option<&Crop>,
         filter: PageFilter,
+        rotation: Rotation,
         output: &Path,
     ) -> Result<(), ProcessingError> {
         let image = load_oriented(original).map_err(processing_error)?;
@@ -43,6 +44,14 @@ impl PageProcessor for ImagePageProcessor {
                 correct_perspective(&image, &crop_to_quad(crop)).map_err(processing_error)?
             }
             None => image,
+        };
+        // Turned after straightening: the crop corners stay in the original
+        // image's coordinates, which is what the crop editor shows.
+        let page = match rotation {
+            Rotation::None => page,
+            Rotation::Clockwise90 => page.rotate90(),
+            Rotation::Clockwise180 => page.rotate180(),
+            Rotation::Clockwise270 => page.rotate270(),
         };
         let page = match filter {
             PageFilter::Original => page,

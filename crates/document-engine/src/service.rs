@@ -6,6 +6,7 @@ use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
 use crate::model::{
     Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
+    Rotation,
 };
 use crate::ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
@@ -382,11 +383,16 @@ where
             }
             None => None,
         };
-        if page.crop.is_some() || page.filter != PageFilter::Original || processed.is_some() {
+        if page.crop.is_some()
+            || page.filter != PageFilter::Original
+            || page.rotation != Rotation::None
+            || processed.is_some()
+        {
             self.repository.set_page_rendering(
                 page_id,
                 page.crop.as_ref(),
                 page.filter,
+                page.rotation,
                 processed.as_deref(),
                 now,
             )?;
@@ -490,8 +496,8 @@ where
     /// number of times.
     pub fn crop_page(&self, page_id: PageId, crop: Crop) -> Result<Page, DocumentError> {
         let page = self.get_page(page_id)?;
-        let filter = page.filter;
-        self.render(page, Some(crop), filter)
+        let (filter, rotation) = (page.filter, page.rotation);
+        self.render(page, Some(crop), filter, rotation)
     }
 
     /// Applies `filter` to the page, on top of its crop if it has one.
@@ -504,11 +510,36 @@ where
         filter: PageFilter,
     ) -> Result<Page, DocumentError> {
         let page = self.get_page(page_id)?;
-        let crop = page.crop;
-        self.render(page, crop, filter)
+        let (crop, rotation) = (page.crop, page.rotation);
+        self.render(page, crop, filter, rotation)
     }
 
-    /// Re-renders `page` with `crop` and `filter`.
+    /// Turns the page a quarter, clockwise or counterclockwise, keeping its
+    /// crop and filter.
+    pub fn rotate_page(&self, page_id: PageId, clockwise: bool) -> Result<Page, DocumentError> {
+        let page = self.get_page(page_id)?;
+        let (crop, filter, rotation) = (page.crop, page.filter, page.rotation.turned(clockwise));
+        self.render(page, crop, filter, rotation)
+    }
+
+    /// Sets the page's whole rendering at once (crop, filter and rotation),
+    /// e.g. to undo or redo an edit. Rendering only happens if something
+    /// differs from what the page has now.
+    pub fn set_page_rendering(
+        &self,
+        page_id: PageId,
+        crop: Option<Crop>,
+        filter: PageFilter,
+        rotation: Rotation,
+    ) -> Result<Page, DocumentError> {
+        let page = self.get_page(page_id)?;
+        if page.crop == crop && page.filter == filter && page.rotation == rotation {
+            return Ok(page);
+        }
+        self.render(page, crop, filter, rotation)
+    }
+
+    /// Re-renders `page` with `crop`, `filter` and `rotation`.
     ///
     /// The new image goes to a fresh path and the database is updated only
     /// after it is fully written; the previous processed image is deleted
@@ -518,17 +549,25 @@ where
         page: Page,
         crop: Option<Crop>,
         filter: PageFilter,
+        rotation: Rotation,
     ) -> Result<Page, DocumentError> {
-        let processed = if crop.is_none() && filter == PageFilter::Original {
-            None
-        } else {
-            let path = self.files.new_processed_path(page.document_id, page.id);
-            let original = self.files.resolve(&page.original_path);
-            self.processor
-                .render_page(&original, crop.as_ref(), filter, &self.files.resolve(&path))
-                .map_err(|e| processing_error(e, &page))?;
-            Some(path)
-        };
+        let processed =
+            if crop.is_none() && filter == PageFilter::Original && rotation == Rotation::None {
+                None
+            } else {
+                let path = self.files.new_processed_path(page.document_id, page.id);
+                let original = self.files.resolve(&page.original_path);
+                self.processor
+                    .render_page(
+                        &original,
+                        crop.as_ref(),
+                        filter,
+                        rotation,
+                        &self.files.resolve(&path),
+                    )
+                    .map_err(|e| processing_error(e, &page))?;
+                Some(path)
+            };
 
         let updated = self
             .repository
@@ -536,6 +575,7 @@ where
                 page.id,
                 crop.as_ref(),
                 filter,
+                rotation,
                 processed.as_deref(),
                 self.clock.now_ms(),
             )
@@ -852,6 +892,7 @@ mod tests {
                 original_path: p.original_path.clone(),
                 crop: None,
                 filter: PageFilter::Original,
+                rotation: Rotation::None,
                 processed_path: None,
                 created_at_ms: p.created_at_ms,
             };
@@ -945,6 +986,7 @@ mod tests {
             id: PageId,
             crop: Option<&Crop>,
             filter: PageFilter,
+            rotation: Rotation,
             processed_path: Option<&Path>,
             _updated_at_ms: i64,
         ) -> Result<Page, PortError> {
@@ -955,6 +997,7 @@ mod tests {
             let page = pages.iter_mut().find(|p| p.id == id).unwrap();
             page.crop = crop.copied();
             page.filter = filter;
+            page.rotation = rotation;
             page.processed_path = processed_path.map(Path::to_path_buf);
             Ok(page.clone())
         }
@@ -1102,6 +1145,7 @@ mod tests {
             _original: &Path,
             _crop: Option<&Crop>,
             _filter: PageFilter,
+            _rotation: Rotation,
             output: &Path,
         ) -> Result<(), ProcessingError> {
             if let Some(fail) = self.fail_render {
@@ -1853,5 +1897,91 @@ mod tests {
 
         let copy = svc.duplicate_document(doc.id, "Luz (copia)").unwrap();
         assert_eq!((copy.folder_id, copy.size_bytes), (Some(folder.id), 300));
+    }
+
+    #[test]
+    fn rotation_turns_both_ways() {
+        assert_eq!(Rotation::None.turned(true), Rotation::Clockwise90);
+        assert_eq!(Rotation::Clockwise270.turned(true), Rotation::None);
+        assert_eq!(Rotation::None.turned(false), Rotation::Clockwise270);
+        assert_eq!(Rotation::from_degrees(180).unwrap().degrees(), 180);
+        assert!(matches!(
+            Rotation::from_degrees(45),
+            Err(DocumentError::InvalidRotation { degrees: 45 })
+        ));
+    }
+
+    #[test]
+    fn rotating_renders_and_keeps_crop_and_filter() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        let page = svc.set_page_filter(page.id, PageFilter::Grayscale).unwrap();
+
+        let turned = svc.rotate_page(page.id, true).unwrap();
+        assert_eq!(
+            (turned.rotation, turned.filter),
+            (Rotation::Clockwise90, PageFilter::Grayscale)
+        );
+        assert_ne!(turned.processed_path, page.processed_path, "a new image");
+
+        // Four turns are a full circle: back to no rotation, still filtered.
+        let mut page = turned;
+        for _ in 0..3 {
+            page = svc.rotate_page(page.id, true).unwrap();
+        }
+        assert_eq!(page.rotation, Rotation::None);
+        assert!(
+            page.processed_path.is_some(),
+            "the filter still needs an image"
+        );
+
+        // A rotation alone also needs a processed image.
+        let plain = svc.add_page(doc.id, &img).unwrap();
+        let plain = svc.rotate_page(plain.id, false).unwrap();
+        assert_eq!(plain.rotation, Rotation::Clockwise270);
+        assert!(plain.processed_path.is_some());
+    }
+
+    #[test]
+    fn whole_renderings_can_be_restored() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let original = svc.add_page(doc.id, &img).unwrap();
+        let edited = svc.crop_page(original.id, crop()).unwrap();
+        let edited = svc.rotate_page(edited.id, true).unwrap();
+
+        // Restoring what it already has doesn't render again.
+        let same = svc
+            .set_page_rendering(edited.id, edited.crop, edited.filter, edited.rotation)
+            .unwrap();
+        assert_eq!(same.processed_path, edited.processed_path);
+
+        // Undo everything: back to the plain original, no processed image.
+        let undone = svc
+            .set_page_rendering(edited.id, None, PageFilter::Original, Rotation::None)
+            .unwrap();
+        assert_eq!(
+            (undone.crop, undone.rotation, undone.processed_path),
+            (None, Rotation::None, None)
+        );
+    }
+
+    #[test]
+    fn duplicates_keep_the_rotation() {
+        let svc = service(InMemoryRepo::default());
+        let doc = svc.create_document("Doc").unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        let page = svc.add_page(doc.id, &img).unwrap();
+        svc.rotate_page(page.id, true).unwrap();
+
+        let copy = svc.duplicate_document(doc.id, "Copia").unwrap();
+
+        assert_eq!(
+            svc.list_pages(copy.id).unwrap()[0].rotation,
+            Rotation::Clockwise90
+        );
     }
 }

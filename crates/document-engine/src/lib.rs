@@ -16,6 +16,7 @@ pub use clock::{Clock, SystemClock};
 pub use error::{DocumentError, PortError, ProcessingError};
 pub use model::{
     Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
+    Rotation,
 };
 pub use ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
