@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::model::{DocumentId, PageId};
+use crate::model::{DocumentId, FolderId, PageId};
 
 /// Failure reported by a port implementation (database, file system, ...).
 ///
@@ -52,6 +52,9 @@ pub enum DocumentError {
 
     #[error("page not found: {0}")]
     PageNotFound(PageId),
+
+    #[error("folder not found: {0}")]
+    FolderNotFound(FolderId),
 
     #[error("document has no pages: {0}")]
     EmptyDocument(DocumentId),

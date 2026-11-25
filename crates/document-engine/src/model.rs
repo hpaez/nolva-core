@@ -52,6 +52,11 @@ id_type!(
     PageId
 );
 
+id_type!(
+    /// Identifier of a folder.
+    FolderId
+);
+
 /// A scanned document: an ordered collection of pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
@@ -66,6 +71,22 @@ pub struct Document {
     pub cover_path: Option<PathBuf>,
     /// When the document was moved to the trash; `None` while it isn't.
     pub trashed_at_ms: Option<i64>,
+    /// Folder it's in; `None` for the top level.
+    pub folder_id: Option<FolderId>,
+    /// Bytes its page images take (originals and processed). Filled in by
+    /// the service when listing; 0 elsewhere.
+    pub size_bytes: u64,
+}
+
+/// A folder of documents. Folders don't nest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folder {
+    pub id: FolderId,
+    pub name: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// Documents in it, not counting trashed ones. Derived on read.
+    pub document_count: u32,
 }
 
 /// Page outline chosen for cropping: four corners in normalized coordinates

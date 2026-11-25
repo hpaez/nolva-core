@@ -116,6 +116,14 @@ impl PageFileStore for LocalPageFileStore {
             .join(format!("processed-{}.jpg", uuid::Uuid::new_v4().simple()))
     }
 
+    fn file_size(&self, relative: &Path) -> Result<Option<u64>, PortError> {
+        match fs::metadata(self.root.join(relative)) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PortError::new("read file size", e)),
+        }
+    }
+
     fn copy_file(&self, from: &Path, to: &Path) -> Result<(), PortError> {
         let source = self.root.join(from);
         let target = self.root.join(to);
@@ -367,6 +375,8 @@ mod tests {
         store.copy_file(&from, &to).unwrap();
 
         assert_eq!(fs::read(store.resolve(&to)).unwrap(), b"jpeg");
+        assert_eq!(store.file_size(&to).unwrap(), Some(4));
+        assert_eq!(store.file_size(Path::new("nope.jpg")).unwrap(), None);
         assert!(store.resolve(&from).exists());
         let missing = store.new_processed_path(d, PageId::new());
         assert!(

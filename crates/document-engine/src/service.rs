@@ -1,10 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::clock::Clock;
 use crate::error::{DocumentError, ProcessingError};
-use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
+use crate::model::{
+    Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
+};
 use crate::ports::{
     CleanupSummary, CornerDetection, DocumentExporter, DocumentRepository, DocxExportOptions,
     ExportPage, ExportSummary, PageFileStore, PageProcessor, PdfExportOptions,
@@ -58,7 +60,19 @@ where
     }
 
     pub fn create_document(&self, title: &str) -> Result<Document, DocumentError> {
+        self.create_document_in(title, None)
+    }
+
+    /// Creates an empty document in `folder` (`None`: the top level).
+    pub fn create_document_in(
+        &self,
+        title: &str,
+        folder: Option<FolderId>,
+    ) -> Result<Document, DocumentError> {
         let title = normalize_title(title)?;
+        if let Some(folder) = folder {
+            self.get_folder(folder)?;
+        }
         let now = self.clock.now_ms();
         let document = Document {
             id: DocumentId::new(),
@@ -68,13 +82,95 @@ where
             page_count: 0,
             cover_path: None,
             trashed_at_ms: None,
+            folder_id: folder,
+            size_bytes: 0,
         };
         self.repository.insert_document(&document)?;
         Ok(document)
     }
 
+    /// Documents not in the trash, most recently updated first, with their sizes.
     pub fn list_documents(&self) -> Result<Vec<Document>, DocumentError> {
-        Ok(self.repository.list_documents()?)
+        self.with_sizes(self.repository.list_documents()?)
+    }
+
+    /// Fills in [`Document::size_bytes`] from the files on disk. Sizes are
+    /// informational, so unreadable files just count as 0.
+    fn with_sizes(&self, mut documents: Vec<Document>) -> Result<Vec<Document>, DocumentError> {
+        if documents.is_empty() {
+            return Ok(documents);
+        }
+        let mut sizes: HashMap<DocumentId, u64> = HashMap::new();
+        for (document, path) in self.repository.files_by_document()? {
+            if let Ok(Some(size)) = self.files.file_size(&path) {
+                *sizes.entry(document).or_default() += size;
+            }
+        }
+        for document in &mut documents {
+            document.size_bytes = sizes.get(&document.id).copied().unwrap_or(0);
+        }
+        Ok(documents)
+    }
+
+    fn with_size(&self, document: Document) -> Result<Document, DocumentError> {
+        let id = document.id;
+        self.with_sizes(vec![document])?
+            .pop()
+            .ok_or(DocumentError::DocumentNotFound(id))
+    }
+
+    /// Creates a folder. Names follow the same rules as titles.
+    pub fn create_folder(&self, name: &str) -> Result<Folder, DocumentError> {
+        let name = normalize_title(name)?;
+        let now = self.clock.now_ms();
+        let folder = Folder {
+            id: FolderId::new(),
+            name,
+            created_at_ms: now,
+            updated_at_ms: now,
+            document_count: 0,
+        };
+        self.repository.insert_folder(&folder)?;
+        Ok(folder)
+    }
+
+    /// All folders, by name.
+    pub fn list_folders(&self) -> Result<Vec<Folder>, DocumentError> {
+        Ok(self.repository.list_folders()?)
+    }
+
+    pub fn get_folder(&self, id: FolderId) -> Result<Folder, DocumentError> {
+        self.repository
+            .get_folder(id)?
+            .ok_or(DocumentError::FolderNotFound(id))
+    }
+
+    pub fn rename_folder(&self, id: FolderId, name: &str) -> Result<Folder, DocumentError> {
+        let name = normalize_title(name)?;
+        self.repository
+            .rename_folder(id, &name, self.clock.now_ms())?
+            .ok_or(DocumentError::FolderNotFound(id))
+    }
+
+    /// Deletes a folder. Its documents are kept and move to the top level.
+    pub fn delete_folder(&self, id: FolderId) -> Result<(), DocumentError> {
+        if !self.repository.delete_folder(id)? {
+            return Err(DocumentError::FolderNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Moves documents into `folder` (`None`: the top level). Returns how
+    /// many moved; ids that no longer exist are skipped.
+    pub fn move_documents(
+        &self,
+        documents: &[DocumentId],
+        folder: Option<FolderId>,
+    ) -> Result<u32, DocumentError> {
+        if let Some(folder) = folder {
+            self.get_folder(folder)?;
+        }
+        Ok(self.repository.move_documents(documents, folder)?)
     }
 
     pub fn rename_document(&self, id: DocumentId, title: &str) -> Result<Document, DocumentError> {
@@ -177,14 +273,16 @@ where
         if !self.repository.set_document_trashed(id, None)? {
             return Err(DocumentError::DocumentNotFound(id));
         }
-        self.repository
+        let document = self
+            .repository
             .get_document(id)?
-            .ok_or(DocumentError::DocumentNotFound(id))
+            .ok_or(DocumentError::DocumentNotFound(id))?;
+        self.with_size(document)
     }
 
     /// Documents in the trash, most recently trashed first.
     pub fn list_trash(&self) -> Result<Vec<Document>, DocumentError> {
-        Ok(self.repository.list_trashed_documents()?)
+        self.with_sizes(self.repository.list_trashed_documents()?)
     }
 
     /// Deletes every trashed document for good. Returns how many.
@@ -223,9 +321,10 @@ where
         title: &str,
     ) -> Result<Document, DocumentError> {
         let title = normalize_title(title)?;
-        if self.repository.get_document(id)?.is_none() {
-            return Err(DocumentError::DocumentNotFound(id));
-        }
+        let source = self
+            .repository
+            .get_document(id)?
+            .ok_or(DocumentError::DocumentNotFound(id))?;
         let pages = self.repository.list_pages(id)?;
         let now = self.clock.now_ms();
         let copy = Document {
@@ -236,6 +335,9 @@ where
             page_count: 0,
             cover_path: None,
             trashed_at_ms: None,
+            // The copy sits next to the original.
+            folder_id: source.folder_id,
+            size_bytes: 0,
         };
         self.repository.insert_document(&copy)?;
 
@@ -247,9 +349,11 @@ where
             let _ = self.files.remove_document_files(copy.id);
             return Err(error);
         }
-        self.repository
+        let copy = self
+            .repository
             .get_document(copy.id)?
-            .ok_or(DocumentError::DocumentNotFound(copy.id))
+            .ok_or(DocumentError::DocumentNotFound(copy.id))?;
+        self.with_size(copy)
     }
 
     /// Appends a copy of `page` (files, rendering and current text) to `document_id`.
@@ -608,6 +712,7 @@ mod tests {
         fail_set_crop: bool,
         texts: Mutex<HashMap<PageId, (PageText, String)>>,
         searched: Mutex<Option<String>>,
+        folders: Mutex<HashMap<FolderId, Folder>>,
     }
 
     impl DocumentRepository for InMemoryRepo {
@@ -650,6 +755,79 @@ mod tests {
                 .get_mut(&id)
                 .map(|d| d.trashed_at_ms = trashed_at_ms)
                 .is_some())
+        }
+        fn files_by_document(&self) -> Result<Vec<(DocumentId, PathBuf)>, PortError> {
+            Ok(self
+                .pages
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|p| {
+                    std::iter::once((p.document_id, p.original_path.clone()))
+                        .chain(p.processed_path.clone().map(|path| (p.document_id, path)))
+                })
+                .collect())
+        }
+        fn insert_folder(&self, folder: &Folder) -> Result<(), PortError> {
+            self.folders
+                .lock()
+                .unwrap()
+                .insert(folder.id, folder.clone());
+            Ok(())
+        }
+        fn get_folder(&self, id: FolderId) -> Result<Option<Folder>, PortError> {
+            let docs = self.docs.lock().unwrap();
+            Ok(self.folders.lock().unwrap().get(&id).map(|f| Folder {
+                document_count: docs
+                    .values()
+                    .filter(|d| d.folder_id == Some(id) && d.trashed_at_ms.is_none())
+                    .count() as u32,
+                ..f.clone()
+            }))
+        }
+        fn list_folders(&self) -> Result<Vec<Folder>, PortError> {
+            let ids: Vec<_> = self.folders.lock().unwrap().keys().copied().collect();
+            let mut folders: Vec<_> = ids
+                .into_iter()
+                .filter_map(|id| self.get_folder(id).unwrap())
+                .collect();
+            folders.sort_by_key(|f| f.name.to_lowercase());
+            Ok(folders)
+        }
+        fn rename_folder(
+            &self,
+            id: FolderId,
+            name: &str,
+            updated_at_ms: i64,
+        ) -> Result<Option<Folder>, PortError> {
+            if let Some(f) = self.folders.lock().unwrap().get_mut(&id) {
+                f.name = name.to_owned();
+                f.updated_at_ms = updated_at_ms;
+            }
+            self.get_folder(id)
+        }
+        fn delete_folder(&self, id: FolderId) -> Result<bool, PortError> {
+            for d in self.docs.lock().unwrap().values_mut() {
+                if d.folder_id == Some(id) {
+                    d.folder_id = None;
+                }
+            }
+            Ok(self.folders.lock().unwrap().remove(&id).is_some())
+        }
+        fn move_documents(
+            &self,
+            documents: &[DocumentId],
+            folder: Option<FolderId>,
+        ) -> Result<u32, PortError> {
+            let mut docs = self.docs.lock().unwrap();
+            let mut moved = 0;
+            for id in documents {
+                if let Some(d) = docs.get_mut(id) {
+                    d.folder_id = folder;
+                    moved += 1;
+                }
+            }
+            Ok(moved)
         }
         fn trashed_before(&self, cutoff_ms: i64) -> Result<Vec<DocumentId>, PortError> {
             Ok(self
@@ -864,6 +1042,10 @@ mod tests {
             let mut counter = self.counter.lock().unwrap();
             *counter += 1;
             PathBuf::from(format!("{d}/{p}/processed-{counter}.jpg"))
+        }
+        fn file_size(&self, _relative: &Path) -> Result<Option<u64>, PortError> {
+            // Every stored file "weighs" 100 bytes.
+            Ok(Some(100))
         }
         fn copy_file(&self, _from: &Path, to: &Path) -> Result<(), PortError> {
             if *self.fail_copy.lock().unwrap() {
@@ -1579,5 +1761,97 @@ mod tests {
 
     fn ids_of(documents: Vec<Document>) -> Vec<DocumentId> {
         documents.into_iter().map(|d| d.id).collect()
+    }
+
+    #[test]
+    fn folders_hold_documents_until_deleted() {
+        let svc = service(InMemoryRepo::default());
+        let bills = svc.create_folder(" Cuentas ").unwrap();
+        let work = svc.create_folder("archivo").unwrap();
+        assert_eq!(bills.name, "Cuentas");
+        let names: Vec<_> = svc
+            .list_folders()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, ["archivo", "Cuentas"], "by name, ignoring case");
+
+        let inside = svc.create_document_in("Luz", Some(bills.id)).unwrap();
+        let loose = svc.create_document("Suelto").unwrap();
+        assert_eq!(inside.folder_id, Some(bills.id));
+        assert_eq!(
+            svc.move_documents(&[loose.id, DocumentId::new()], Some(bills.id))
+                .unwrap(),
+            1
+        );
+        assert_eq!(svc.get_folder(bills.id).unwrap().document_count, 2);
+
+        svc.move_to_trash(loose.id).unwrap();
+        assert_eq!(
+            svc.get_folder(bills.id).unwrap().document_count,
+            1,
+            "trash doesn't count"
+        );
+
+        assert_eq!(
+            svc.rename_folder(work.id, "Trabajo").unwrap().name,
+            "Trabajo"
+        );
+        svc.delete_folder(bills.id).unwrap();
+        let docs = svc.list_documents().unwrap();
+        assert!(
+            docs.iter().all(|d| d.folder_id.is_none()),
+            "documents survive"
+        );
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn folder_operations_check_the_folder_exists() {
+        let svc = service(InMemoryRepo::default());
+        let missing = FolderId::new();
+        let doc = svc.create_document("Doc").unwrap();
+        for result in [
+            svc.create_document_in("x", Some(missing)).map(|_| ()),
+            svc.move_documents(&[doc.id], Some(missing)).map(|_| ()),
+            svc.rename_folder(missing, "x").map(|_| ()),
+            svc.delete_folder(missing),
+        ] {
+            assert!(matches!(result, Err(DocumentError::FolderNotFound(id)) if id == missing));
+        }
+        assert!(matches!(
+            svc.create_folder("  "),
+            Err(DocumentError::InvalidTitle { .. })
+        ));
+        assert_eq!(
+            svc.move_documents(&[doc.id], None).unwrap(),
+            1,
+            "back to the top level"
+        );
+    }
+
+    #[test]
+    fn listings_include_sizes_and_copies_stay_in_their_folder() {
+        let svc = service(InMemoryRepo::default());
+        let folder = svc.create_folder("Cuentas").unwrap();
+        let doc = svc.create_document_in("Luz", Some(folder.id)).unwrap();
+        let (_dir, img) = temp_image("scan.jpg");
+        svc.add_page(doc.id, &img).unwrap();
+        let page = svc.add_page(doc.id, &img).unwrap();
+        svc.crop_page(page.id, crop()).unwrap();
+        svc.create_document("Vacío").unwrap();
+
+        let sizes: HashMap<_, _> = svc
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.title, d.size_bytes))
+            .collect();
+        assert_eq!(sizes["Luz"], 300, "two originals and one processed image");
+        assert_eq!(sizes["Vacío"], 0);
+
+        let copy = svc.duplicate_document(doc.id, "Luz (copia)").unwrap();
+        assert_eq!((copy.folder_id, copy.size_bytes), (Some(folder.id), 300));
     }
 }

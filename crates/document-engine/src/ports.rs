@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{PortError, ProcessingError};
-use crate::model::{Crop, Document, DocumentId, ImageFormat, NewPage, Page, PageFilter, PageId};
+use crate::model::{
+    Crop, Document, DocumentId, Folder, FolderId, ImageFormat, NewPage, Page, PageFilter, PageId,
+};
 use crate::text::{PageText, TextLine, TextMatch};
 
 /// Persistence of document and page metadata.
@@ -28,6 +30,37 @@ pub trait DocumentRepository: Send + Sync {
 
     /// Documents trashed before `cutoff_ms`.
     fn trashed_before(&self, cutoff_ms: i64) -> Result<Vec<DocumentId>, PortError>;
+
+    /// Every stored file of every document (originals and processed
+    /// images), relative to the storage root, for computing sizes.
+    fn files_by_document(&self) -> Result<Vec<(DocumentId, PathBuf)>, PortError>;
+
+    fn insert_folder(&self, folder: &Folder) -> Result<(), PortError>;
+
+    fn get_folder(&self, id: FolderId) -> Result<Option<Folder>, PortError>;
+
+    /// All folders, by name (case-insensitive).
+    fn list_folders(&self) -> Result<Vec<Folder>, PortError>;
+
+    /// Renames a folder. Returns it, or `None` if it doesn't exist.
+    fn rename_folder(
+        &self,
+        id: FolderId,
+        name: &str,
+        updated_at_ms: i64,
+    ) -> Result<Option<Folder>, PortError>;
+
+    /// Deletes a folder; its documents (trashed ones too) move to the top
+    /// level. Returns whether it existed.
+    fn delete_folder(&self, id: FolderId) -> Result<bool, PortError>;
+
+    /// Puts `documents` in `folder` (`None`: the top level), atomically.
+    /// Unknown ids are skipped. Returns how many moved.
+    fn move_documents(
+        &self,
+        documents: &[DocumentId],
+        folder: Option<FolderId>,
+    ) -> Result<u32, PortError>;
 
     /// Appends a page at the end of its document and bumps the document's
     /// `updated_at_ms`, atomically. The repository assigns the position, so
@@ -127,6 +160,9 @@ pub trait PageFileStore: Send + Sync {
     /// Copies stored file `from` to `to` (both relative to the storage
     /// root), atomically, creating `to`'s folder if needed.
     fn copy_file(&self, from: &Path, to: &Path) -> Result<(), PortError>;
+
+    /// Size of a stored file in bytes, or `None` if it's missing.
+    fn file_size(&self, relative: &Path) -> Result<Option<u64>, PortError>;
 
     /// Removes a single stored file. Missing files are not an error.
     fn remove_file(&self, relative: &Path) -> Result<(), PortError>;
