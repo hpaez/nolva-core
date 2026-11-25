@@ -1433,6 +1433,7 @@ mod tests {
     const PDF: PdfExportOptions = PdfExportOptions {
         paper_size: crate::ports::PaperSize::A4,
         margin_mm: 0.0,
+        page_numbers: false,
     };
 
     #[test]

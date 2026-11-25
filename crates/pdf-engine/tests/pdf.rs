@@ -187,6 +187,7 @@ fn fit_image_pages_follow_the_image_shape() {
     let options = PdfOptions {
         page_size: PageSize::FitImage,
         margin_mm: 0.0,
+        page_numbers: false,
     };
 
     write_pdf("x", &image_pages(&[receipt]), &options, &output).unwrap();
@@ -299,4 +300,64 @@ fn pdfs_without_text_have_no_font() {
                 .is_ok_and(|n| n == b"Font")
         });
     assert!(!has_font);
+}
+
+#[test]
+fn page_numbers_are_off_by_default_and_printed_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = [
+        write_jpeg(dir.path(), "a.jpg", 600, 800),
+        write_jpeg(dir.path(), "b.jpg", 600, 800),
+    ];
+
+    let plain = dir.path().join("plain.pdf");
+    write_pdf("x", &image_pages(&images), &PdfOptions::default(), &plain).unwrap();
+    let doc = Document::load(&plain).unwrap();
+    assert!(doc.extract_text(&[1, 2]).unwrap().trim().is_empty());
+
+    let numbered = dir.path().join("numbered.pdf");
+    let options = PdfOptions {
+        page_numbers: true,
+        ..PdfOptions::default()
+    };
+    write_pdf("x", &image_pages(&images), &options, &numbered).unwrap();
+    let doc = Document::load(&numbered).unwrap();
+    assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "1 / 2");
+    assert_eq!(doc.extract_text(&[2]).unwrap().trim(), "2 / 2");
+    let ids: Vec<_> = doc.get_pages().values().copied().collect();
+    let content = String::from_utf8_lossy(&doc.get_page_content(ids[1])).into_owned();
+    assert!(
+        content.contains("0 Tr"),
+        "numbers must be visible: {content}"
+    );
+}
+
+#[test]
+fn page_numbers_stay_visible_after_an_invisible_text_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pdf");
+    let pages = vec![PdfPage {
+        image: write_jpeg(dir.path(), "a.jpg", 600, 800),
+        text: vec![TextBox {
+            text: "Hola".into(),
+            left: 0.1,
+            top: 0.1,
+            right: 0.5,
+            bottom: 0.15,
+        }],
+    }];
+    let options = PdfOptions {
+        page_numbers: true,
+        ..PdfOptions::default()
+    };
+
+    write_pdf("x", &pages, &options, &output).unwrap();
+
+    let doc = Document::load(&output).unwrap();
+    let id = *doc.get_pages().values().next().unwrap();
+    let content = String::from_utf8_lossy(&doc.get_page_content(id)).into_owned();
+    let invisible = content.find("3 Tr").unwrap();
+    let visible = content.rfind("0 Tr").unwrap();
+    assert!(visible > invisible, "{content}");
+    assert_eq!(doc.get_page_fonts(id).unwrap().len(), 2);
 }

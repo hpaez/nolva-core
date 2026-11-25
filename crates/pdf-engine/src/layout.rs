@@ -26,6 +26,9 @@ pub struct PdfOptions {
     pub page_size: PageSize,
     /// White margin around the image on fixed-size pages, in millimetres.
     pub margin_mm: f32,
+    /// Print "n / total" at the bottom centre of each page. Off by default:
+    /// the PDF looks exactly like the scans unless asked otherwise.
+    pub page_numbers: bool,
 }
 
 impl Default for PdfOptions {
@@ -33,6 +36,7 @@ impl Default for PdfOptions {
         Self {
             page_size: PageSize::A4,
             margin_mm: 0.0,
+            page_numbers: false,
         }
     }
 }
@@ -102,6 +106,7 @@ mod tests {
         let options = PdfOptions {
             page_size: PageSize::FitImage,
             margin_mm: 10.0,
+            page_numbers: false,
         };
         let (w, h, p) = place(&options, 1000, 2000);
         assert!(approx(w, A4_WIDTH) && approx(h, A4_WIDTH * 2.0));
@@ -119,6 +124,7 @@ mod tests {
         let options = PdfOptions {
             page_size: PageSize::Letter,
             margin_mm: 25.4,
+            page_numbers: false,
         }; // 1 inch
         let (w, h, p) = place(&options, 1000, 1000);
         assert_eq!((w, h), (612.0, 792.0));
