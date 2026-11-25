@@ -1,9 +1,12 @@
 version: 2
+
+# Monthly: each update PR runs the whole CI, and minutes cost money on a
+# private repo. Security updates still arrive as soon as they are published.
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     groups:
       actions:
         patterns: ["*"]
@@ -11,7 +14,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]

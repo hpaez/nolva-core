@@ -3,16 +3,19 @@
 # Actions artifacts, and every release adds an .aar with native libraries
 # for three ABIs.
 #
-# Runs after each successful release, monthly as a safety net, and by hand.
+# Runs after each release (called by it), monthly as a safety net, and by hand.
 # An app pinned to a deleted version can no longer resolve it: keep at
 # least as many versions as anything may still depend on.
 
 name: Prune packages
 
 on:
-  workflow_run:
-    workflows: [Release]
-    types: [completed]
+  # Called by the release workflow once a new version is published.
+  workflow_call:
+    inputs:
+      keep:
+        type: string
+        default: "5"
   schedule:
     - cron: "17 6 1 * *" # monthly
   workflow_dispatch:
@@ -32,8 +35,6 @@ permissions:
 
 jobs:
   prune:
-    # After a release only if it succeeded: a failed one published nothing.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:

@@ -1,25 +1,43 @@
 # Publishes a versioned release of the core:
-#   - iOS:     NolvaCoreFFI.xcframework.zip as a GitHub Release asset, plus a
-#              release commit (Package.swift pointing at it + Swift bindings)
-#              reachable only from tag vX.Y.Z.
 #   - Android: app.nolva:nolva-core:X.Y.Z (.aar) to GitHub Packages.
+#   - iOS (on request): NolvaCoreFFI.xcframework.zip as a GitHub Release
+#     asset, plus a release commit (Package.swift pointing at it + Swift
+#     bindings) reachable only from tag vX.Y.Z.
+#
+# When it runs:
+#   - Automatically, after CI passes on a push to main, if the version in
+#     the root Cargo.toml ([workspace.package] version) has no tag yet.
+#     Bumping the version in a PR is the decision to release; merging it is
+#     the approval. Other merges leave the version alone and publish nothing.
+#   - By hand (Actions → Release → Run workflow), e.g. to build iOS too.
+#
+# Nothing is validated twice: the automatic run starts only after CI passed
+# on that very commit, and main only takes PRs whose CI passed.
+#
+# Cost: macOS runners bill 10x Linux minutes on private repos, so the iOS
+# build only runs when asked by hand (input "ios").
 #
 # The release commit is NOT pushed to main: main is protected (PRs, signed
 # commits, required checks) and doesn't need it. SwiftPM resolves packages by
 # tag, so apps pinned to vX.Y.Z get the binary; main keeps an empty binary URL,
 # which Package.swift treats as "use a local build".
-#
-# Run it manually from the Actions tab after bumping the version in the root
-# Cargo.toml ([workspace.package] version) on main.
 
 name: Release
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
         description: "Version to release (must match Cargo.toml, e.g. 0.1.0)"
         required: true
+      ios:
+        description: "Also build the iOS XCFramework (macOS: 10x the minutes)"
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -30,39 +48,67 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  VERSION: ${{ inputs.version }}
-  TAG: v${{ inputs.version }}
 
 jobs:
+  # Decides whether to release, which version and which commit.
   verify:
+    # Automatic runs: only for CI that passed on a push to main (never for
+    # pull requests, which also run CI).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.check.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
-      - name: Check version and tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z"; exit 1; }
-          cargo_version=$(grep -m1 -E '^version = ' Cargo.toml | cut -d'"' -f2)
-          [[ "$cargo_version" == "$VERSION" ]] || { echo "::error::Cargo.toml has $cargo_version"; exit 1; }
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-            echo "::error::tag $TAG already exists"; exit 1
-          fi
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: host
-      - run: cargo test --workspace --locked
+          # The commit CI validated, not whatever main points at now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          WANTED: ${{ inputs.version }}
+        run: |
+          version=$(grep -m1 -E '^version = ' Cargo.toml | cut -d'"' -f2)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Cargo.toml version must be X.Y.Z, got $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          tagged=false
+          git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null && tagged=true
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            # By hand: from main only, for the version in Cargo.toml, once.
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "::error::run the release from main"; exit 1; }
+            [[ "$WANTED" == "$version" ]] || { echo "::error::Cargo.toml has $version, not $WANTED"; exit 1; }
+            [[ "$tagged" == false ]] || { echo "::error::v$version is already released"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$tagged" == true ]]; then
+            echo "v$version is already released: nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version $version: releasing."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
 
   apple:
     needs: verify
+    if: needs.verify.outputs.release == 'true' && inputs.ios
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: v${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
@@ -100,13 +146,45 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$TAG" --draft=false --verify-tag
 
+  # Without iOS: tag the validated commit and publish a release without
+  # assets. SwiftPM consumers need the iOS build; there are none yet.
+  tag:
+    needs: verify
+    if: needs.verify.outputs.release == 'true' && !inputs.ios
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: v${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+      - name: Tag and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Nolva core $VERSION"
+          git push origin "refs/tags/$TAG"
+          gh release create "$TAG" --verify-tag --title "$TAG" \
+            --notes "Nolva core $VERSION (Android only: built without iOS)"
+
   android:
-    needs: apple
+    needs: [verify, apple, tag]
+    # Exactly one of apple and tag runs; continue if it succeeded.
+    if: ${{ always() && (needs.apple.result == 'success' || needs.tag.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: v${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -131,3 +209,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: gradle -p android :nolva-core:publish -PcoreVersion="$VERSION"
+
+  # Keeps GitHub Packages under the Free plan's storage after each release.
+  prune:
+    needs: android
+    uses: ./.github/workflows/prune-packages.yml
+    permissions:
+      contents: read
+      packages: write
