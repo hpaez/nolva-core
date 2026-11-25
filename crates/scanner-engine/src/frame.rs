@@ -73,8 +73,12 @@ fn upright_luma(frame: &LumaFrame<'_>) -> Result<GrayImage, FrameError> {
         return Err(FrameError::InvalidRotation(rotation_degrees));
     }
     let (w, stride) = (width as usize, row_stride as usize);
-    // The last row may be unpadded.
-    let needed = stride * (height as usize - 1) + w;
+    // The last row may be unpadded. Checked: on 32-bit devices absurd
+    // dimensions could wrap around and pass the length check.
+    let needed = stride
+        .checked_mul(height as usize - 1)
+        .and_then(|n| n.checked_add(w))
+        .unwrap_or(usize::MAX);
     if pixels.len() < needed {
         return Err(FrameError::TooShort {
             needed,
@@ -101,6 +105,23 @@ fn upright_luma(frame: &LumaFrame<'_>) -> Result<GrayImage, FrameError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    #[test]
+    fn absurd_dimensions_are_too_short_not_a_crash() {
+        let pixels = [0u8; 16];
+        let frame = LumaFrame {
+            width: 4,
+            height: u32::MAX,
+            row_stride: u32::MAX,
+            pixels: &pixels,
+            rotation_degrees: 0,
+        };
+        assert!(matches!(
+            detect_document_in_frame(&frame),
+            Err(FrameError::TooShort { .. })
+        ));
+    }
+
     use super::*;
     use image::Luma;
     use imageproc::drawing::draw_polygon_mut;
