@@ -1,5 +1,6 @@
 //! PDF generation: one page per image, in order, optionally with the
-//! page's recognized text as an invisible, selectable layer (see [`TextBox`]).
+//! page's recognized text as an invisible, selectable layer (see [`TextBox`])
+//! and, if asked, page numbers (see [`PdfOptions::page_numbers`]).
 //!
 //! JPEGs that are already upright are embedded byte for byte (PDF supports
 //! JPEG natively via `DCTDecode`), so exporting never loses quality and is
@@ -9,6 +10,7 @@
 
 mod embed;
 mod layout;
+mod numbers;
 mod text;
 
 use std::fs::{self, File};
@@ -121,9 +123,15 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         ));
         font.finish();
     }
+    let numbers_font_id = alloc();
+    if options.page_numbers {
+        pdf.type1_font(numbers_font_id)
+            .base_font(Name(b"Helvetica"))
+            .encoding_predefined(Name(b"WinAnsiEncoding"));
+    }
 
     let image_name = Name(b"Im0");
-    for (source, &page_id) in pages.iter().zip(&page_ids) {
+    for (index, (source, &page_id)) in pages.iter().zip(&page_ids).enumerate() {
         let path = &source.image;
         let embedded = embed::prepare(path)?;
         let (page_w, page_h, placement) = layout::place(options, embedded.width, embedded.height);
@@ -157,6 +165,13 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         content.x_object(image_name);
         content.restore_state();
         text::draw(&mut content, &source.text, &placement);
+        if options.page_numbers {
+            numbers::draw(
+                &mut content,
+                &numbers::label(index + 1, pages.len()),
+                page_w,
+            );
+        }
         pdf.stream(content_id, &content.finish());
 
         let mut page = pdf.page(page_id);
@@ -165,8 +180,15 @@ fn build_pdf(title: &str, pages: &[PdfPage], options: &PdfOptions) -> Result<Vec
         page.contents(content_id);
         let mut resources = page.resources();
         resources.x_objects().pair(image_name, image_id);
-        if !source.text.is_empty() {
-            resources.fonts().pair(text::FONT_NAME, font_id);
+        // One /Font dictionary per page: writing it twice would keep only the last.
+        if !source.text.is_empty() || options.page_numbers {
+            let mut fonts = resources.fonts();
+            if !source.text.is_empty() {
+                fonts.pair(text::FONT_NAME, font_id);
+            }
+            if options.page_numbers {
+                fonts.pair(numbers::FONT_NAME, numbers_font_id);
+            }
         }
         resources.finish();
         page.finish();

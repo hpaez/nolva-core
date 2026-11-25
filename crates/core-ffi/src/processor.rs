@@ -105,6 +105,7 @@ impl DocumentExporter for PdfDocumentExporter {
                 PaperSize::Legal => PageSize::Legal,
             },
             margin_mm: options.margin_mm,
+            page_numbers: options.page_numbers,
         };
         let pages: Vec<PdfPage> = pages
             .iter()

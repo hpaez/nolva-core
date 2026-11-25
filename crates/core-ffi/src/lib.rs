@@ -223,6 +223,9 @@ pub struct PdfOptions {
     pub paper_size: PaperSize,
     /// White margin around each image on fixed-size pages, in millimetres.
     pub margin_mm: f32,
+    /// Print "n / total" at the bottom centre of each page. Off unless asked.
+    #[uniffi(default = false)]
+    pub page_numbers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
@@ -563,6 +566,7 @@ impl NolvaCore {
                 PaperSize::Legal => document_engine::PaperSize::Legal,
             },
             margin_mm: options.margin_mm,
+            page_numbers: options.page_numbers,
         };
         let summary = self.service.export_pdf(id, &output, &options)?;
         Ok(PdfExportInfo {
@@ -1275,6 +1279,7 @@ mod tests {
         let options = PdfOptions {
             paper_size: PaperSize::A4,
             margin_mm: 0.0,
+            page_numbers: false,
         };
         assert_eq!(
             core.export_pdf(doc.id, pdf.to_string_lossy().into(), options)
@@ -1345,6 +1350,7 @@ mod tests {
                 PdfOptions {
                     paper_size: PaperSize::A4,
                     margin_mm: 5.0,
+                    page_numbers: false,
                 },
             )
             .unwrap();
@@ -1363,6 +1369,7 @@ mod tests {
         let options = PdfOptions {
             paper_size: PaperSize::FitImage,
             margin_mm: 0.0,
+            page_numbers: false,
         };
 
         assert!(matches!(

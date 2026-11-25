@@ -231,6 +231,8 @@ pub struct PdfExportOptions {
     pub paper_size: PaperSize,
     /// White margin on fixed-size pages, in millimetres.
     pub margin_mm: f32,
+    /// Print "n / total" at the bottom of each page.
+    pub page_numbers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
